@@ -1,0 +1,171 @@
+# Trading Bot Configuration
+
+# API Configuration
+api:
+  # API credentials are loaded from .env file
+  timeout: 30
+  max_retries: 3
+
+# Trading Parameters
+trading:
+  # Supported: ONE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, TWO_HOUR, SIX_HOUR, ONE_DAY
+  candle_granularity: "FIFTEEN_MINUTE"  # Changed from FIVE_MINUTE for better data availability
+  candle_periods_for_analysis: 200  # Increased from 100 for more reliable indicators
+  loop_sleep_seconds: 60
+  max_products_to_analyze: 20
+  max_ws_subscriptions: 100
+  
+  # Full market scan interval (every N cycles)
+  # Set to 1 to scan every cycle, 10 to scan every 10th cycle, etc.
+  full_scan_interval_cycles: 1
+  
+  # Parallel processing for faster scanning
+  # WARNING: Too many workers will trigger API rate limits (HTTP 429)
+  max_scan_workers: 3  # Max concurrent threads for market scanning (1-5 recommended)
+  max_holdings_workers: 2  # Max concurrent threads for holdings analysis (1-3 recommended)
+  
+  # Minimum signal confidence to execute trades (0.0 to 1.0)
+  min_signal_confidence: 0.50
+  
+  # IMPORTANT: Set to false for live trading
+  paper_trading_mode: true
+
+# Risk Management
+risk_management:
+  # Maximum percentage of total portfolio to risk on a single trade
+  risk_percent_per_trade: 0.01  # 1%
+  
+  # Maximum percentage of portfolio to allocate to any single position
+  max_position_size_percent: 0.10  # 10%
+  
+  # Maximum total exposure (sum of all positions as % of portfolio)
+  max_total_exposure_percent: 0.50  # 50%
+  
+  # Default stop loss percentage below entry
+  default_stop_loss_percent: 0.015  # 1.5%
+  
+  # Default take profit percentage above entry
+  default_take_profit_percent: 0.03  # 3%
+  
+  # Trailing stop loss (if enabled, will move stop up as price increases)
+  use_trailing_stop: false
+  trailing_stop_percent: 0.02  # 2%
+  
+  # Maximum allowed drawdown before stopping trading
+  max_drawdown_percent: 0.15  # 15%
+  
+  # Minimum USD equivalent value to consider for trading
+  min_usd_trade_value: 10.0
+  
+  # Maximum number of concurrent positions
+  max_concurrent_positions: 5
+  
+  # Maximum fee percentage allowed per trade (as % of position value)
+  max_fee_percent: 1.0  # 1%
+  
+  # Maximum slippage percentage allowed per trade
+  max_slippage_percent: 0.5  # 0.5%
+
+# Strategy Selection and Parameters
+strategies:
+  # Active strategy: momentum, mean_reversion, breakout, hybrid, or custom
+  active_strategy: "momentum"
+  
+  # Momentum Strategy Parameters
+  momentum:
+    rsi_period: 14
+    rsi_oversold: 30
+    rsi_overbought: 70
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    bb_period: 20
+    bb_std: 2.0
+    volume_threshold: 1.5  # Volume must be 1.5x average
+  
+  # Mean Reversion Strategy Parameters
+  mean_reversion:
+    bb_period: 20
+    bb_std: 2.0
+    rsi_period: 14
+    rsi_extreme_oversold: 20
+    rsi_extreme_overbought: 80
+    mean_lookback: 50
+  
+  # Breakout Strategy Parameters
+  breakout:
+    lookback_period: 20
+    volume_confirmation: true
+    volume_threshold: 2.0
+    atr_period: 14
+    atr_multiplier: 1.5
+  
+  # Hybrid Strategy (combines multiple signals)
+  hybrid:
+    use_momentum: true
+    use_mean_reversion: true
+    use_breakout: false
+    min_signals_required: 2  # Require at least 2 strategies to agree
+
+# Performance & Analytics
+analytics:
+  # Track performance metrics
+  calculate_sharpe_ratio: true
+  calculate_sortino_ratio: true
+  risk_free_rate: 0.04  # 4% annual risk-free rate
+  
+  # Save equity curve data
+  save_equity_curve: true
+  equity_curve_interval: 3600  # seconds (1 hour)
+  
+  # Generate reports
+  daily_report: true
+  weekly_report: true
+
+# Monitoring & Alerts
+monitoring:
+  # Health check interval (seconds)
+  health_check_interval: 300  # 5 minutes
+  
+  # Alert configuration
+  alerts:
+    enabled: false
+    email:
+      enabled: false
+      smtp_server: "smtp.gmail.com"
+      smtp_port: 587
+      from_address: ""
+      to_addresses: []
+      password_env_var: "EMAIL_PASSWORD"
+    
+    # Alert triggers
+    alert_on_trade: false
+    alert_on_error: true
+    alert_on_large_loss: true
+    large_loss_threshold: 0.05  # 5%
+    alert_on_connection_loss: true
+
+# Database Configuration
+database:
+  type: "sqlite"
+  path: "data/trading_bot.db"
+  backup_enabled: true
+  backup_interval: 86400  # seconds (24 hours)
+
+# Backtesting Configuration
+backtesting:
+  enabled: false
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  initial_capital: 10000.0
+  data_source: "coinbase"  # or "csv"
+  csv_path: "data/historical/"
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_to_file: true
+  log_to_console: true
+  log_directory: "logs"
+  max_log_size_mb: 100
+  backup_count: 10
