@@ -140,12 +140,11 @@ class MeanReversionStrategy(BaseStrategy):
         else:
             buy_reasons.append("✓ Above EMA 200 (uptrend)")
         
-        if buy_score >= 4:
-            confidence = min(buy_score / 7.0, 1.0)
-            logger.info(f"BUY signal for {product_id}: {', '.join(buy_reasons)}")
-            return TradingSignal('BUY', confidence=confidence,
-                               metadata={'reasons': buy_reasons, 'score': buy_score})
+        # --- NEW LOGIC: Calculate confidence and let main loop filter ---
         
+        # Calculate buy confidence (max score is 7)
+        buy_confidence = min(buy_score / 7.0, 1.0)
+
         # SELL conditions (overbought - expecting pullback)
         sell_score = 0
         sell_reasons = []
@@ -185,12 +184,20 @@ class MeanReversionStrategy(BaseStrategy):
             sell_score += 1
             sell_reasons.append("Rejecting from upper BB")
         
-        if sell_score >= 3:
-            confidence = min(sell_score / 6.0, 1.0)
-            logger.info(f"SELL signal for {product_id}: {', '.join(sell_reasons)}")
-            return TradingSignal('SELL', confidence=confidence,
-                               metadata={'reasons': sell_reasons, 'score': sell_score})
+        # Calculate sell confidence (max score is 6)
+        sell_confidence = min(sell_score / 6.0, 1.0)
         
+        # Return the strongest signal, even if low confidence
+        if buy_confidence > sell_confidence and buy_confidence > 0:
+            logger.debug(f"Potential BUY signal for {product_id}: score={buy_score}, confidence={buy_confidence:.2f}")
+            return TradingSignal('BUY', confidence=buy_confidence,
+                               metadata={'reasons': buy_reasons, 'score': buy_score})
+        
+        if sell_confidence > buy_confidence and sell_confidence > 0:
+            logger.debug(f"Potential SELL signal for {product_id}: score={sell_score}, confidence={sell_confidence:.2f}")
+            return TradingSignal('SELL', confidence=sell_confidence,
+                               metadata={'reasons': sell_reasons, 'score': sell_score})
+
         return TradingSignal('HOLD', confidence=0.5,
                            metadata={'rsi': latest[rsi_col],
                                    'distance_from_mean': latest['Distance_From_Mean']})

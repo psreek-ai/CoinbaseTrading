@@ -169,12 +169,11 @@ class BreakoutStrategy(BaseStrategy):
             buy_score += 1
             buy_reasons.append("ATR expanding (volatility increasing)")
         
-        if buy_score >= 5:
-            confidence = min(buy_score / 9.0, 1.0)
-            logger.info(f"BUY signal for {product_id}: {', '.join(buy_reasons)}")
-            return TradingSignal('BUY', confidence=confidence,
-                               metadata={'reasons': buy_reasons, 'score': buy_score})
-        
+        # --- NEW LOGIC: Calculate confidence and let main loop filter ---
+
+        # Calculate buy confidence (max score is 9)
+        buy_confidence = min(buy_score / 9.0, 1.0)
+
         # SELL: Downward breakout or failed breakout
         sell_score = 0
         sell_reasons = []
@@ -201,13 +200,22 @@ class BreakoutStrategy(BaseStrategy):
             sell_score += 2
             sell_reasons.append("Failed upward breakout")
         
-        if sell_score >= 2:
-            confidence = min(sell_score / 5.0, 1.0)
-            logger.info(f"SELL signal for {product_id}: {', '.join(sell_reasons)}")
-            return TradingSignal('SELL', confidence=confidence,
-                               metadata={'reasons': sell_reasons, 'score': sell_score})
+        # Calculate sell confidence (max score is 5)
+        sell_confidence = min(sell_score / 5.0, 1.0)
+
+        # Return the strongest signal, even if low confidence
+        if buy_confidence > sell_confidence and buy_confidence > 0:
+            logger.debug(f"Potential BUY signal for {product_id}: score={buy_score}, confidence={buy_confidence:.2f}")
+            return TradingSignal('BUY', confidence=buy_confidence,
+                               metadata={'reasons': buy_reasons, 'score': buy_score})
         
+        if sell_confidence > buy_confidence and sell_confidence > 0:
+            logger.debug(f"Potential SELL signal for {product_id}: score={sell_score}, confidence={sell_confidence:.2f}")
+            return TradingSignal('SELL', confidence=sell_confidence,
+                               metadata={'reasons': sell_reasons, 'score': sell_score})
+
         return TradingSignal('HOLD', confidence=0.5,
                            metadata={'in_consolidation': in_consolidation,
                                    'bb_squeeze': bb_squeeze,
                                    'range_pct': latest['Range_Pct']})
+

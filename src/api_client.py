@@ -1430,6 +1430,167 @@ class CoinbaseAPI:
             
             return False
     
+    def convert_crypto(self, from_asset: str, to_asset: str, amount: str) -> Optional[Dict]:
+        """
+        Convert one cryptocurrency to another using Coinbase Convert API.
+        This is more efficient than selling and buying separately.
+        
+        Args:
+            from_asset: Source cryptocurrency symbol (e.g., 'ETH', 'BTC')
+            to_asset: Target cryptocurrency symbol (e.g., 'SOL', 'USDC')
+            amount: Amount of source asset to convert
+            
+        Returns:
+            Dict with conversion details if successful, None otherwise
+            {
+                'trade_id': str,
+                'from_amount': str,
+                'from_currency': str,
+                'to_amount': str,
+                'to_currency': str,
+                'exchange_rate': str,
+                'status': str
+            }
+        """
+        try:
+            # Get account IDs for source and target currencies
+            logger.info(f"Getting account IDs for {from_asset} and {to_asset}")
+            
+            accounts_response = self.rest_client.get_accounts()
+            self._update_rate_limits(accounts_response)
+            
+            from_account_id = None
+            to_account_id = None
+            
+            if hasattr(accounts_response, 'accounts'):
+                for account in accounts_response.accounts:
+                    if account.currency == from_asset:
+                        from_account_id = account.uuid
+                    if account.currency == to_asset:
+                        to_account_id = account.uuid
+            
+            if not from_account_id:
+                logger.error(f"Could not find account ID for {from_asset}")
+                return None
+            
+            if not to_account_id:
+                logger.error(f"Could not find account ID for {to_asset}")
+                return None
+            
+            logger.info(f"From account: {from_account_id} ({from_asset})")
+            logger.info(f"To account: {to_account_id} ({to_asset})")
+            
+            # Step 1: Create a convert quote
+            logger.info(f"Creating convert quote: {amount} {from_asset} -> {to_asset}")
+            
+            quote_response = self.rest_client.create_convert_quote(
+                from_account=from_account_id,
+                to_account=to_account_id,
+                amount=amount
+            )
+            
+            # Update rate limits
+            self._update_rate_limits(quote_response)
+            
+            # Log API call
+            self._log_api_call(
+                method='create_convert_quote',
+                endpoint='/convert/quote',
+                params={
+                    'from_account': from_asset,
+                    'to_account': to_asset,
+                    'amount': amount
+                },
+                response=quote_response
+            )
+            
+            # Debug: Log the full response structure
+            logger.info(f"[DEBUG] Convert quote response type: {type(quote_response)}")
+            logger.info(f"[DEBUG] Convert quote response has 'trade': {hasattr(quote_response, 'trade')}")
+            if hasattr(quote_response, 'trade'):
+                logger.info(f"[DEBUG] Trade is None: {quote_response.trade is None}")
+                if quote_response.trade:
+                    logger.info(f"[DEBUG] Trade object type: {type(quote_response.trade)}")
+                    # Log all attributes of trade object
+                    trade_attrs = {attr: getattr(quote_response.trade, attr, 'N/A') for attr in dir(quote_response.trade) if not attr.startswith('_')}
+                    logger.info(f"[DEBUG] Trade attributes: {trade_attrs}")
+            
+            if not hasattr(quote_response, 'trade') or not quote_response.trade:
+                logger.error("Failed to get conversion quote - no trade in response")
+                return None
+            
+            trade = quote_response.trade
+            trade_id = trade.id
+            
+            # Extract conversion details
+            from_amount = getattr(trade, 'amount', {}).get('value', amount)
+            from_currency = getattr(trade, 'source_currency', from_asset)
+            to_amount = getattr(trade, 'subtotal', {}).get('value', 'unknown')
+            to_currency = getattr(trade, 'target_currency', to_asset) if hasattr(trade, 'target_currency') else to_asset
+            exchange_rate = getattr(trade, 'exchange_rate', {}).get('value', 'unknown')
+            
+            logger.info(f"Quote received: {from_amount} {from_currency} -> {to_amount} {to_currency} (rate: {exchange_rate})")
+            
+            # Step 2: Commit the conversion
+            logger.info(f"Committing conversion with trade ID: {trade_id}")
+            
+            commit_response = self.rest_client.commit_convert_trade(
+                trade_id=trade_id,
+                from_account=from_account_id,
+                to_account=to_account_id
+            )
+            
+            # Update rate limits
+            self._update_rate_limits(commit_response)
+            
+            # Log API call
+            self._log_api_call(
+                method='commit_convert_trade',
+                endpoint=f'/convert/trade/{trade_id}',
+                params={
+                    'trade_id': trade_id,
+                    'from_account': from_account_id,
+                    'to_account': to_account_id
+                },
+                response=commit_response
+            )
+            
+            if not hasattr(commit_response, 'trade') or not commit_response.trade:
+                logger.error("Failed to commit conversion - no trade in response")
+                return None
+            
+            committed_trade = commit_response.trade
+            status = getattr(committed_trade, 'status', 'unknown')
+            
+            logger.info(f"[SUCCESS] Conversion committed: {from_amount} {from_currency} -> {to_amount} {to_currency} (status: {status})")
+            
+            return {
+                'trade_id': trade_id,
+                'from_amount': from_amount,
+                'from_currency': from_currency,
+                'to_amount': to_amount,
+                'to_currency': to_currency,
+                'exchange_rate': exchange_rate,
+                'status': status
+            }
+            
+        except Exception as e:
+            logger.error(f"Error converting {from_asset} to {to_asset}: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='convert_crypto',
+                endpoint='/convert',
+                params={
+                    'from_account': from_asset,
+                    'to_account': to_asset,
+                    'amount': amount
+                },
+                error=e
+            )
+            
+            return None
+    
     def get_order_status(self, order_id: str) -> Optional[Dict]:
         """
         Get order status.

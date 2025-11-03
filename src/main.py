@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 from decimal import Decimal
 from datetime import datetime, UTC
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Add src directory to path
@@ -883,6 +883,7 @@ class TradingBot:
                     'product_id': product_id,
                     'signal': signal.action,
                     'confidence': signal.confidence,
+                    'balance': holding['balance'],  # Add balance for conversions
                     'usd_value': holding['usd_value'],
                     'metadata': signal.metadata
                 }
@@ -919,13 +920,164 @@ class TradingBot:
                     else:
                         logger.info(f"[HOLD] {result['asset']}: HOLD (no strong signal) - Value: ${result['usd_value']:.2f}")
         
-        # Summary
+        # Summary and return SELL signals for potential conversion
         should_sell = [h for h in holding_signals if h['signal'] == 'SELL' and h['confidence'] >= min_sell_confidence]
         
         if should_sell:
             logger.warning(f"WARNING: {len(should_sell)} holdings have SELL signals:")
             for h in should_sell:
                 logger.warning(f"   - {h['asset']}: ${h['usd_value']:.2f} (confidence: {h['confidence']:.1%})")
+        
+        return should_sell  # Return holdings with SELL signals for potential conversion
+    
+    def _auto_convert_holdings(self, sell_signals: List[Dict], buy_opportunities: List[Dict]):
+        """
+        Automatically convert holdings with SELL signals into BUY opportunities.
+        Uses Coinbase Convert API for direct crypto-to-crypto conversion.
+        
+        Args:
+            sell_signals: List of holdings with SELL signals
+            buy_opportunities: List of BUY opportunities from market scan
+        """
+        if not sell_signals or not buy_opportunities:
+            return
+        
+        # Sort sell signals by confidence (strongest sell first)
+        sell_signals.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        # Sort buy opportunities by confidence (strongest buy first)
+        buy_opportunities.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        logger.info("\n" + "=" * 80)
+        logger.info("AUTO-CONVERSION ANALYSIS")
+        logger.info("=" * 80)
+        logger.info("Assets with SELL signals:")
+        for s in sell_signals:
+            logger.info(f"  - {s['asset']:10s}: ${s['usd_value']:>10.2f} (confidence: {s['confidence']:.1%})")
+        
+        logger.info("\nTop BUY opportunities:")
+        for b in buy_opportunities[:5]:
+            product_id = b['product_id']
+            target_asset = product_id.split('-')[0]  # Extract base currency (e.g., 'BTC' from 'BTC-USD')
+            logger.info(f"  - {target_asset:10s}: {product_id} (confidence: {b['confidence']:.1%})")
+        
+        logger.info("=" * 80 + "\n")
+        
+        # Convert each SELL signal into the top BUY opportunity
+        conversions_made = 0
+        
+        for sell in sell_signals:
+            if conversions_made >= len(buy_opportunities):
+                logger.info(f"All BUY opportunities used, stopping conversions")
+                break
+            
+            from_asset = sell['asset']
+            from_balance = sell.get('balance', Decimal('0'))
+            
+            # Skip if balance is 0 or invalid
+            if from_balance <= 0:
+                logger.warning(f"Skipping {from_asset}: zero or invalid balance ({from_balance})")
+                continue
+            
+            # Get the next BUY opportunity
+            buy_opp = buy_opportunities[conversions_made]
+            product_id = buy_opp['product_id']
+            to_asset = product_id.split('-')[0]  # Extract base currency
+            
+            # Skip if trying to convert to same asset
+            if from_asset == to_asset:
+                logger.info(f"Skipping conversion: {from_asset} to {to_asset} (same asset)")
+                continue
+            
+            logger.info(f"[CONVERT] {from_asset} -> {to_asset}")
+            logger.info(f"   Selling: {from_asset} (${sell['usd_value']:.2f}, SELL confidence: {sell['confidence']:.1%})")
+            logger.info(f"   Buying: {to_asset} (BUY confidence: {buy_opp['confidence']:.1%})")
+            
+            try:
+                # Try direct conversion first
+                result = self.api.convert_crypto(
+                    from_asset=from_asset,
+                    to_asset=to_asset,
+                    amount=str(from_balance)
+                )
+                
+                if result:
+                    logger.info(f"[SUCCESS] Direct conversion complete!")
+                    logger.info(f"   Traded: {result['from_amount']} {result['from_currency']}")
+                    logger.info(f"   Received: {result['to_amount']} {result['to_currency']}")
+                    logger.info(f"   Rate: {result['exchange_rate']}")
+                    logger.info(f"   Status: {result['status']}")
+                    
+                    conversions_made += 1
+                    
+                    # Log to trade history
+                    self._log_trade_history({
+                        'timestamp': datetime.now(UTC).isoformat(),
+                        'action': 'CONVERT',
+                        'from_asset': from_asset,
+                        'to_asset': to_asset,
+                        'from_amount': result['from_amount'],
+                        'to_amount': result['to_amount'],
+                        'exchange_rate': result['exchange_rate'],
+                        'sell_confidence': sell['confidence'],
+                        'buy_confidence': buy_opp['confidence'],
+                        'trade_id': result['trade_id']
+                    })
+                else:
+                    logger.warning(f"[FALLBACK] Direct conversion not supported, using USDC intermediate")
+                    # Fall back to two-step conversion via USDC
+                    # Step 1: Convert from_asset to USDC
+                    usdc_result = self.api.convert_crypto(
+                        from_asset=from_asset,
+                        to_asset='USDC',
+                        amount=str(from_balance)
+                    )
+                    
+                    if usdc_result:
+                        logger.info(f"   Step 1: {from_asset} -> USDC successful ({usdc_result['to_amount']} USDC)")
+                        
+                        # Step 2: Convert USDC to to_asset
+                        time.sleep(1)  # Rate limiting
+                        
+                        final_result = self.api.convert_crypto(
+                            from_asset='USDC',
+                            to_asset=to_asset,
+                            amount=usdc_result['to_amount']
+                        )
+                        
+                        if final_result:
+                            logger.info(f"[SUCCESS] Two-step conversion complete!")
+                            logger.info(f"   Total: {from_asset} -> {final_result['to_amount']} {to_asset}")
+                            
+                            conversions_made += 1
+                            
+                            # Log to trade history
+                            self._log_trade_history({
+                                'timestamp': datetime.now(UTC).isoformat(),
+                                'action': 'CONVERT_2STEP',
+                                'from_asset': from_asset,
+                                'to_asset': to_asset,
+                                'from_amount': str(from_balance),
+                                'intermediate_usdc': usdc_result['to_amount'],
+                                'to_amount': final_result['to_amount'],
+                                'sell_confidence': sell['confidence'],
+                                'buy_confidence': buy_opp['confidence']
+                            })
+                        else:
+                            logger.error(f"[FAILED] Step 2 failed: USDC -> {to_asset}")
+                    else:
+                        logger.error(f"[FAILED] Step 1 failed: {from_asset} -> USDC")
+                    
+            except Exception as e:
+                logger.error(f"[ERROR] Conversion error {from_asset} -> {to_asset}: {e}")
+            
+            # Rate limiting between conversions
+            time.sleep(1)
+        
+        if conversions_made > 0:
+            logger.info("\n" + "=" * 80)
+            logger.info(f"[COMPLETE] AUTO-CONVERSION: {conversions_made} conversions executed")
+            logger.info("=" * 80 + "\n")
     
     def _scan_all_products(self):
         """
@@ -973,7 +1125,7 @@ class TradingBot:
                     df = self.api.get_historical_data(product_id, granularity, periods)
                     
                     if df.empty or len(df) < 50:
-                        logger.info(f"[SCAN] {product_id:15s} - Insufficient data (< 50 candles)")
+                        logger.debug(f"[SCAN] {product_id:15s} - Insufficient data (< 50 candles)")
                         return None
                     
                     # Add indicators first so we can display them
@@ -1015,8 +1167,8 @@ class TradingBot:
                         reason = getattr(signal, 'reason', signal.metadata.get('reason', ''))
                         logger.info(f"[SCAN] {product_id:15s} - SELL      @ ${latest_price:>10.4f} | {indicators} | {reason}")
                     else:
-                        # For HOLD, show indicators
-                        logger.info(f"[SCAN] {product_id:15s} - HOLD      @ ${latest_price:>10.4f} | {indicators}")
+                        # For HOLD, use debug level
+                        logger.debug(f"[SCAN] {product_id:15s} - HOLD      @ ${latest_price:>10.4f} | {indicators}")
                     
                     # Return ALL BUY signals (both above and below threshold) for tracking
                     if signal.action == 'BUY':
@@ -1448,11 +1600,21 @@ class TradingBot:
                 best_opportunities = []
                 
                 try:
-                    # First, analyze current holdings
-                    self._analyze_current_holdings(balances)
+                    # First, analyze current holdings and get SELL signals
+                    sell_signals = self._analyze_current_holdings(balances)
                     
                     # Then scan all products for new opportunities
                     best_opportunities = self._scan_all_products()
+                    
+                    # AUTO-CONVERT: If we have SELL signals and BUY opportunities, convert directly
+                    if sell_signals and best_opportunities:
+                        logger.info("=" * 80)
+                        logger.info(f"AUTO-CONVERT: {len(sell_signals)} assets to sell, {len(best_opportunities)} BUY opportunities")
+                        logger.info("=" * 80)
+                        
+                        # Convert weak holdings into strong opportunities
+                        self._auto_convert_holdings(sell_signals, best_opportunities)
+                    
                     if best_opportunities:
                         logger.info(f"Found {len(best_opportunities)} strong opportunities:")
                         for opp in best_opportunities[:5]:  # Show top 5

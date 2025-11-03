@@ -25,7 +25,7 @@ trading:
   max_holdings_workers: 2  # Max concurrent threads for holdings analysis (1-3 recommended)
   
   # Minimum signal confidence to execute trades (0.0 to 1.0)
-  min_signal_confidence: 0.50
+  min_signal_confidence: 0.50  # 50% confidence threshold for production trading
   
   # IMPORTANT: Set to false for live trading
   paper_trading_mode: false

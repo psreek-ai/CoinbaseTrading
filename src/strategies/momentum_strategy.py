@@ -51,59 +51,52 @@ class MomentumStrategy(BaseStrategy):
             return df
         
         try:
-            # Bollinger Bands
-            try:
-                bbands = df.ta.bbands(length=self.bb_period, std=self.bb_std)
-                if bbands is not None and not bbands.empty:
-                    df = pd.concat([df, bbands], axis=1)
-            except Exception as e:
-                logger.debug(f"Bollinger Bands calculation failed: {e}")
+            # Bollinger Bands (pandas_ta appends std parameter TWICE to column names)
+            bbands = df.ta.bbands(length=self.bb_period, std=self.bb_std)
+            if bbands is not None and not bbands.empty:
+                df = pd.concat([df, bbands], axis=1)
             
             # MACD
-            try:
-                macd = df.ta.macd(fast=self.macd_fast, slow=self.macd_slow, 
-                                 signal=self.macd_signal)
-                if macd is not None and not macd.empty:
-                    df = pd.concat([df, macd], axis=1)
-            except Exception as e:
-                logger.debug(f"MACD calculation failed: {e}")
+            macd = df.ta.macd(fast=self.macd_fast, slow=self.macd_slow, 
+                             signal=self.macd_signal)
+            if macd is not None and not macd.empty:
+                df = pd.concat([df, macd], axis=1)
             
             # RSI
-            try:
-                rsi = df.ta.rsi(length=self.rsi_period)
-                if rsi is not None:
-                    df[f'RSI_{self.rsi_period}'] = rsi
-            except Exception as e:
-                logger.debug(f"RSI calculation failed: {e}")
+            rsi = df.ta.rsi(length=self.rsi_period)
+            if rsi is not None:
+                df[f'RSI_{self.rsi_period}'] = rsi
             
-            # ADX - CRITICAL: Trend strength indicator
-            try:
-                adx = df.ta.adx(length=14)
-                if adx is not None and not adx.empty:
-                    df = pd.concat([df, adx], axis=1)
-            except Exception as e:
-                logger.debug(f"ADX calculation failed: {e}")
+            # ADX - Trend strength indicator
+            adx = df.ta.adx(length=14)
+            if adx is not None and not adx.empty:
+                df = pd.concat([df, adx], axis=1)
             
             # EMA - Trend direction filters
-            try:
-                df['EMA_20'] = df.ta.ema(length=20)
-                df['EMA_50'] = df.ta.ema(length=50)
-                df['EMA_200'] = df.ta.ema(length=200)
-            except Exception as e:
-                logger.debug(f"EMA calculation failed: {e}")
+            df['EMA_20'] = df.ta.ema(length=20)
+            df['EMA_50'] = df.ta.ema(length=50)
             
             # Volume moving average
-            try:
-                df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
-            except Exception as e:
-                logger.debug(f"Volume MA calculation failed: {e}")
+            df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
             
-            # Remove NaN values only if we have enough data
-            initial_len = len(df)
-            df.dropna(inplace=True)
-            
-            if len(df) < initial_len * 0.5:  # Lost more than half the data
-                logger.debug(f"Significant data loss after indicator calculation: {initial_len} -> {len(df)} rows")
+            # Only drop rows where critical indicators are NaN (not all columns)
+            # This preserves data where some non-critical indicators might be NaN
+            critical_indicators = [
+                f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}',
+                f'MACDs_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}',
+                f'RSI_{self.rsi_period}',
+                f'BBL_{self.bb_period}_{self.bb_std}',
+                f'BBM_{self.bb_period}_{self.bb_std}',
+                f'BBU_{self.bb_period}_{self.bb_std}'
+            ]
+            # Only drop if ANY critical indicator is missing
+            existing_critical = [col for col in critical_indicators if col in df.columns]
+            if existing_critical:
+                initial_len = len(df)
+                df.dropna(subset=existing_critical, inplace=True)
+                
+                if len(df) < initial_len * 0.5:  # Lost more than half the data
+                    logger.debug(f"Significant data loss after indicator calculation: {initial_len} -> {len(df)} rows")
             
         except Exception as e:
             logger.error(f"Error adding indicators in MomentumStrategy: {e}")
@@ -117,7 +110,7 @@ class MomentumStrategy(BaseStrategy):
         if not self.validate_data(df):
             return TradingSignal('HOLD', confidence=0.0)
         
-        # Add indicators if not already present (check for MACD column)
+        # Add indicators if not already present
         macd_check = f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         if macd_check not in df.columns:
             df = self.add_indicators(df)
@@ -129,10 +122,10 @@ class MomentumStrategy(BaseStrategy):
         latest = df.iloc[-1]
         previous = df.iloc[-2]
         
-        # Column names (pandas_ta format)
-        upper_bb_col = f'BBU_{self.bb_period}_{self.bb_std}'
-        middle_bb_col = f'BBM_{self.bb_period}_{self.bb_std}'
-        lower_bb_col = f'BBL_{self.bb_period}_{self.bb_std}'
+        # Column names (pandas_ta format - NOTE: std appears TWICE in BB column names)
+        upper_bb_col = f'BBU_{self.bb_period}_{self.bb_std}_{self.bb_std}'
+        middle_bb_col = f'BBM_{self.bb_period}_{self.bb_std}_{self.bb_std}'
+        lower_bb_col = f'BBL_{self.bb_period}_{self.bb_std}_{self.bb_std}'
         macd_col = f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         macd_signal_col = f'MACDs_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         rsi_col = f'RSI_{self.rsi_period}'
@@ -142,14 +135,11 @@ class MomentumStrategy(BaseStrategy):
         required_cols = [upper_bb_col, middle_bb_col, lower_bb_col, 
                         macd_col, macd_signal_col, rsi_col]
         if not all(col in df.columns for col in required_cols):
-            logger.debug(f"Missing required indicators for {product_id} (insufficient data)")
             return TradingSignal('HOLD', confidence=0.0)
         
-        # CRITICAL FILTER: Only trade in strong trends (ADX > 25)
-        if adx_col in df.columns:
-            if latest[adx_col] < 25:
-                logger.debug(f"{product_id}: ADX too low ({latest[adx_col]:.1f}), market not trending")
-                return TradingSignal('HOLD', confidence=0.0)
+        # Filter: Only trade in strong trends (ADX > 15)
+        if adx_col in df.columns and latest[adx_col] < 15:
+            return TradingSignal('HOLD', confidence=0.0)
         
         # CRITICAL FILTER: Confirm trend direction with EMAs
         bullish_trend = True
@@ -196,12 +186,10 @@ class MomentumStrategy(BaseStrategy):
             buy_score += 1
             buy_reasons.append("EMA bullish alignment")
         
-        # BUY signal (need at least 4 points for quality)
-        if buy_score >= 4:
-            confidence = min(buy_score / 6.0, 1.0)
-            logger.info(f"BUY signal for {product_id}: {', '.join(buy_reasons)}")
-            return TradingSignal('BUY', confidence=confidence, 
-                               metadata={'reasons': buy_reasons, 'score': buy_score})
+        # --- NEW LOGIC: Calculate confidence and let main loop filter ---
+        
+        # Calculate buy confidence (max score is 6)
+        buy_confidence = min(buy_score / 6.0, 1.0)
         
         # Check SELL conditions - IMPROVED
         sell_score = 0
@@ -229,15 +217,23 @@ class MomentumStrategy(BaseStrategy):
             sell_score += 1
             sell_reasons.append("Price below middle BB")
         
-        # SELL signal (need at least 2 points)
-        if sell_score >= 2:
-            confidence = min(sell_score / 5.0, 1.0)
-            logger.info(f"SELL signal for {product_id}: {', '.join(sell_reasons)}")
-            return TradingSignal('SELL', confidence=confidence,
-                               metadata={'reasons': sell_reasons, 'score': sell_score})
+        # Calculate sell confidence (max score is 5)
+        sell_confidence = min(sell_score / 5.0, 1.0)
         
+        # Return the strongest signal
+        if buy_confidence > sell_confidence and buy_confidence > 0:
+            logger.debug(f"BUY signal for {product_id}: score={buy_score}, confidence={buy_confidence:.2f}")
+            return TradingSignal('BUY', confidence=buy_confidence, 
+                               metadata={'reasons': buy_reasons, 'score': buy_score})
+        
+        if sell_confidence > buy_confidence and sell_confidence > 0:
+            logger.debug(f"SELL signal for {product_id}: score={sell_score}, confidence={sell_confidence:.2f}")
+            return TradingSignal('SELL', confidence=sell_confidence,
+                               metadata={'reasons': sell_reasons, 'score': sell_score})
+
         # HOLD
         return TradingSignal('HOLD', confidence=0.5,
                            metadata={'latest_rsi': latest[rsi_col],
                                    'latest_close': latest['Close'],
                                    'adx': latest[adx_col] if adx_col in df.columns else None})
+
