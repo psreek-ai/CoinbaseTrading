@@ -1203,9 +1203,89 @@ class TradingBot:
                             
                             logger.info(f"Position opened for {product_id} at ${actual_fill_price}")
                         
+                        # --- REFACTORED SELL FILL HANDLING ---
                         elif side == 'SELL':
-                            # This was an exit order (SL/TP) - position is already closed
-                            logger.info(f"Exit order filled for {product_id} at ${actual_fill_price}")
+                            logger.info(f"[LIVE] Exit order {order_id} FILLED for {product_id} at ${actual_fill_price}")
+                            
+                            # Find the corresponding open position in the database
+                            position = self.db.get_position(product_id)
+                            
+                            if not position:
+                                logger.warning(f"Got a SELL fill for {order_id}, but no open position found in DB for {product_id}")
+                                continue
+                            
+                            # 1. Determine Exit Reason & PnL
+                            entry_price = Decimal(str(position['entry_price']))
+                            position_size = Decimal(str(position['base_size']))
+                            pnl = (actual_fill_price - entry_price) * position_size
+                            pnl_percent = ((actual_fill_price - entry_price) / entry_price) * 100
+                            
+                            position_metadata = position.get('metadata', {})
+                            if isinstance(position_metadata, str):
+                                import json
+                                position_metadata = json.loads(position_metadata)
+                            
+                            exit_reason = 'unknown_exit'
+                            if order_id == position_metadata.get('stop_order_id'):
+                                exit_reason = 'stop_loss'
+                            elif order_id == position_metadata.get('tp_order_id'):
+                                exit_reason = 'take_profit'
+                            
+                            logger.info(f"[LIVE] Closing {product_id}. Reason: {exit_reason}. PnL: ${pnl:.2f} ({pnl_percent:.2f}%)")
+                            
+                            # 2. Close the position in the database
+                            self.db.close_position(product_id, float(actual_fill_price), float(pnl))
+                            
+                            # 3. Record in trade history
+                            entry_time = position.get('opened_at')
+                            exit_time = datetime.now(UTC).isoformat()
+                            holding_time = None
+                            if entry_time:
+                                try:
+                                    entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                                    exit_dt = datetime.fromisoformat(exit_time.replace('Z', '+00:00'))
+                                    holding_time = int((exit_dt - entry_dt).total_seconds())
+                                except:
+                                    pass
+                            
+                            self.db.insert_trade_history({
+                                'product_id': product_id,
+                                'side': 'BUY',  # The original entry side
+                                'entry_price': float(entry_price),
+                                'exit_price': float(actual_fill_price),
+                                'size': float(position_size),
+                                'pnl': float(pnl),
+                                'pnl_percent': float(pnl_percent),
+                                'fees': float(actual_commission) + float(position_metadata.get('fees_paid', 0)),
+                                'holding_time_seconds': holding_time,
+                                'entry_time': entry_time,
+                                'exit_time': exit_time,
+                                'strategy': position_metadata.get('strategy', self.strategy.name),
+                                'exit_reason': exit_reason,
+                                'metadata': {'fill_order_id': order_id, 'live_trade': True}
+                            })
+                            
+                            # 4. CRITICAL: Cancel the other outstanding bracket order
+                            other_order_id = None
+                            if exit_reason == 'stop_loss':
+                                other_order_id = position_metadata.get('tp_order_id')  # SL filled, cancel TP
+                            elif exit_reason == 'take_profit':
+                                other_order_id = position_metadata.get('stop_order_id')  # TP filled, cancel SL
+                            
+                            if other_order_id:
+                                logger.info(f"Cancelling other bracket order: {other_order_id}")
+                                try:
+                                    self.api.cancel_order(other_order_id)
+                                    # Update the cancelled order in DB
+                                    cursor = self.db.conn.cursor()
+                                    cursor.execute(
+                                        "UPDATE orders SET status = 'cancelled' WHERE client_order_id = ?",
+                                        (other_order_id,)
+                                    )
+                                    self.db.conn.commit()
+                                except Exception as e:
+                                    logger.warning(f"Failed to cancel other order {other_order_id}: {e}")
+                        # --- END REFACTORED SELL FILL HANDLING ---
                     
                     elif api_status in ['CANCELLED', 'EXPIRED']:
                         logger.info(f"Order {order_id} is {api_status}")
@@ -1318,25 +1398,33 @@ class TradingBot:
                     current_price = self.api.get_latest_price(product_id)
                     
                     if current_price:
-                        # Update position price
+                        # Update position price in DB for PnL tracking (all modes)
                         self.db.update_position(product_id, current_price=float(current_price))
                         
-                        # Check if should close
-                        should_close, reason = self.risk_manager.should_close_position(
-                            position, current_price
-                        )
-                        
-                        if should_close:
-                            logger.info(f"Closing position {product_id}: {reason}")
-                            self.execute_sell_order(product_id, position, reason)
-                        
-                        # Update trailing stop if enabled
-                        elif self.risk_manager.use_trailing_stop:
-                            new_stop = self.risk_manager.update_trailing_stop(
+                        # --- REFACTORED EXIT LOGIC ---
+                        # Paper trading MUST poll for SL/TP as it has no real exchange orders
+                        if self.paper_trading:
+                            # Check if should close based on polling
+                            should_close, reason = self.risk_manager.should_close_position(
                                 position, current_price
                             )
-                            if new_stop:
-                                self.db.update_position(product_id, stop_loss=float(new_stop))
+                            
+                            if should_close:
+                                logger.info(f"[PAPER] Closing position {product_id}: {reason}")
+                                self.execute_sell_order(product_id, position, reason)
+                            
+                            # Update trailing stop if enabled
+                            elif self.risk_manager.use_trailing_stop:
+                                new_stop = self.risk_manager.update_trailing_stop(
+                                    position, current_price
+                                )
+                                if new_stop:
+                                    self.db.update_position(product_id, stop_loss=float(new_stop))
+                        
+                        # In live mode, SL/TP exits are handled by _check_open_orders()
+                        # which reacts to FILLED events from exchange's native orders.
+                        # This eliminates the race condition between bot polling and exchange execution.
+                        # --- END REFACTORED EXIT LOGIC ---
                 
                 # Run full market scan every cycle
                 logger.info("=" * 80)

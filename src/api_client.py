@@ -55,7 +55,12 @@ class CoinbaseAPI:
         # Rate limiting to prevent HTTP 429 errors
         self._rate_limit_lock = Lock()
         self._last_request_time = 0
-        self._min_request_interval = 0.2  # 200ms between requests (~5 req/sec max)
+        self._min_request_interval = 0.2  # 200ms between requests (~5 req/sec max) - fallback
+        
+        # Dynamic rate limiting from Coinbase response headers
+        self._rate_limit_remaining = None  # x-ratelimit-remaining
+        self._rate_limit_limit = None      # x-ratelimit-limit  
+        self._rate_limit_reset = None      # x-ratelimit-reset (timestamp)
         
         # API response logging configuration
         self.log_api_responses = False
@@ -154,28 +159,91 @@ class CoinbaseAPI:
         api_response_logger.debug(json.dumps(log_entry, indent=2, default=str))
     
     def _initialize_rest_client(self):
-        """Initialize REST API client."""
+        """Initialize REST API client with rate limit headers enabled."""
         try:
             self.rest_client = RESTClient(
                 api_key=self.api_key,
-                api_secret=self.api_secret
+                api_secret=self.api_secret,
+                rate_limit_headers=True  # Enable rate limit headers in responses
             )
-            logger.info("REST client initialized successfully")
+            logger.info("REST client initialized successfully with rate limit headers")
         except Exception as e:
             logger.error(f"Error initializing REST client: {e}")
             raise
     
     def _rate_limit(self):
-        """Enforce rate limiting between API requests."""
+        """
+        Enforce adaptive rate limiting between API requests.
+        Uses Coinbase response headers (x-ratelimit-remaining, x-ratelimit-reset) when available,
+        falls back to static 200ms delay otherwise.
+        """
         with self._rate_limit_lock:
             current_time = time.time()
             time_since_last = current_time - self._last_request_time
             
-            if time_since_last < self._min_request_interval:
-                sleep_time = self._min_request_interval - time_since_last
-                time.sleep(sleep_time)
+            # Calculate adaptive delay based on rate limit headers
+            sleep_time = self._min_request_interval  # Default fallback
+            
+            if self._rate_limit_remaining is not None and self._rate_limit_reset is not None:
+                # If we're running low on requests, slow down
+                if self._rate_limit_remaining < 10:
+                    # Calculate time until reset
+                    time_until_reset = max(0, self._rate_limit_reset - current_time)
+                    
+                    if self._rate_limit_remaining > 0:
+                        # Spread remaining requests evenly until reset
+                        sleep_time = time_until_reset / self._rate_limit_remaining
+                        logger.debug(f"Adaptive rate limit: {self._rate_limit_remaining} requests left, "
+                                   f"sleeping {sleep_time:.3f}s")
+                    else:
+                        # Out of requests, wait until reset
+                        sleep_time = time_until_reset + 0.1  # Small buffer
+                        logger.warning(f"Rate limit exhausted, waiting {sleep_time:.1f}s until reset")
+                        
+                elif self._rate_limit_remaining > 100:
+                    # Plenty of capacity, minimal delay
+                    sleep_time = 0.05  # 50ms
+                else:
+                    # Moderate capacity, standard delay
+                    sleep_time = self._min_request_interval
+            
+            # Apply rate limiting delay
+            if time_since_last < sleep_time:
+                actual_sleep = sleep_time - time_since_last
+                time.sleep(actual_sleep)
             
             self._last_request_time = time.time()
+    
+    def _update_rate_limits(self, response):
+        """
+        Extract and update rate limit info from Coinbase API response headers.
+        
+        Args:
+            response: API response object that may contain rate limit headers
+        """
+        try:
+            # Check if response has headers attribute (some SDK responses do)
+            if hasattr(response, '__dict__'):
+                headers = getattr(response, 'headers', None) or getattr(response, '_headers', None)
+                
+                if headers:
+                    # Extract rate limit headers (case-insensitive)
+                    for key, value in headers.items():
+                        key_lower = key.lower()
+                        
+                        if key_lower == 'x-ratelimit-remaining':
+                            self._rate_limit_remaining = int(value)
+                        elif key_lower == 'x-ratelimit-limit':
+                            self._rate_limit_limit = int(value)
+                        elif key_lower == 'x-ratelimit-reset':
+                            self._rate_limit_reset = int(value)
+                    
+                    if self._rate_limit_remaining is not None:
+                        logger.debug(f"Rate limit updated: {self._rate_limit_remaining}/{self._rate_limit_limit} "
+                                   f"remaining, resets at {self._rate_limit_reset}")
+        except Exception as e:
+            # Don't fail if header extraction fails, just use static rate limiting
+            logger.debug(f"Could not extract rate limit headers: {e}")
     
     def _initialize_ws_client(self):
         """Initialize WebSocket client."""
@@ -450,6 +518,9 @@ class CoinbaseAPI:
         try:
             response = self.rest_client.get_portfolios()
             
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
+            
             # Log API call
             self._log_api_call(
                 method='get_portfolios',
@@ -487,6 +558,9 @@ class CoinbaseAPI:
         """
         try:
             response = self.rest_client.get_portfolios()
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
             
             # Log API call
             self._log_api_call(
@@ -534,6 +608,9 @@ class CoinbaseAPI:
         """
         try:
             response = self.rest_client.create_portfolio(name=name)
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
             
             # Log API call
             self._log_api_call(
@@ -586,6 +663,9 @@ class CoinbaseAPI:
             breakdown = self.rest_client.get_portfolio_breakdown(
                 portfolio_uuid=portfolio_id
             )
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(breakdown)
             
             # Log API response
             self._log_api_call(
@@ -644,6 +724,9 @@ class CoinbaseAPI:
             
             response = self.rest_client.get_products()
             
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
+            
             # Log API call
             self._log_api_call(
                 method='get_products',
@@ -696,6 +779,9 @@ class CoinbaseAPI:
                 self._rate_limit()
                 
                 product_info = self.rest_client.get_product(product_id=product_id)
+                
+                # Update rate limits from response headers
+                self._update_rate_limits(product_info)
                 
                 # Log API call
                 self._log_api_call(
@@ -794,6 +880,9 @@ class CoinbaseAPI:
                 granularity=granularity
             )
             
+            # Update rate limits from response headers
+            self._update_rate_limits(candles_data)
+            
             # Log API response
             self._log_api_call(
                 method='get_candles',
@@ -872,6 +961,9 @@ class CoinbaseAPI:
             
             product = self.rest_client.get_product(product_id=product_id)
             
+            # Update rate limits from response headers
+            self._update_rate_limits(product)
+            
             # Log API call
             self._log_api_call(
                 method='get_product',
@@ -920,6 +1012,9 @@ class CoinbaseAPI:
                 quote_size=str(size) if side == "BUY" else None,
                 base_size=str(size) if side == "SELL" else None
             )
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
             
             # Log API call
             self._log_api_call(
@@ -1004,6 +1099,9 @@ class CoinbaseAPI:
                 end_date=end_date.isoformat()
             )
             
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
+            
             # Log API call
             self._log_api_call(
                 method='get_transaction_summary',
@@ -1062,6 +1160,9 @@ class CoinbaseAPI:
         """
         try:
             response = self.rest_client.get_api_key_permissions()
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
             
             # Log API call
             self._log_api_call(
@@ -1133,6 +1234,9 @@ class CoinbaseAPI:
                 stop_price=str(stop_price),
                 stop_direction="STOP_DIRECTION_STOP_DOWN" if side == "SELL" else "STOP_DIRECTION_STOP_UP"
             )
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
             
             # Log API call
             self._log_api_call(
@@ -1221,6 +1325,9 @@ class CoinbaseAPI:
                 take_profit_limit_price=str(take_profit_price)
             )
             
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
+            
             # Log API call
             self._log_api_call(
                 method='trigger_bracket_order_gtc',
@@ -1290,6 +1397,9 @@ class CoinbaseAPI:
         try:
             response = self.rest_client.cancel_orders(order_ids=[order_id])
             
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
+            
             # Log API call
             self._log_api_call(
                 method='cancel_orders',
@@ -1332,6 +1442,9 @@ class CoinbaseAPI:
         """
         try:
             response = self.rest_client.get_order(order_id=order_id)
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
             
             # Log API call
             self._log_api_call(
@@ -1385,6 +1498,9 @@ class CoinbaseAPI:
             self._rate_limit()
             
             response = self.rest_client.get_best_bid_ask(product_ids=product_ids)
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
             
             # Log API call
             self._log_api_call(
@@ -1477,6 +1593,9 @@ class CoinbaseAPI:
                 post_only=post_only
             )
             
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
+            
             # Log API response
             self._log_api_call(
                 method='limit_order_gtc',
@@ -1563,6 +1682,9 @@ class CoinbaseAPI:
             
             response = self.rest_client.get_fills(**params)
             
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
+            
             # Log API call
             self._log_api_call(
                 method='get_fills',
@@ -1634,6 +1756,9 @@ class CoinbaseAPI:
                 product_id=product_id,
                 limit=limit
             )
+            
+            # Update rate limits from response headers
+            self._update_rate_limits(response)
             
             # Log API call
             self._log_api_call(
