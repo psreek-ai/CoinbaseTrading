@@ -117,8 +117,10 @@ class MomentumStrategy(BaseStrategy):
         if not self.validate_data(df):
             return TradingSignal('HOLD', confidence=0.0)
         
-        # Add indicators
-        df = self.add_indicators(df)
+        # Add indicators if not already present (check for MACD column)
+        macd_check = f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
+        if macd_check not in df.columns:
+            df = self.add_indicators(df)
         
         if len(df) < 2:
             return TradingSignal('HOLD', confidence=0.0)
@@ -153,25 +155,23 @@ class MomentumStrategy(BaseStrategy):
         bullish_trend = True
         bearish_trend = True
         if 'EMA_20' in df.columns and 'EMA_50' in df.columns:
-            bullish_trend = latest['EMA_20'] > latest['EMA_50']
-            bearish_trend = latest['EMA_20'] < latest['EMA_50']
+            bullish_trend = bool(latest['EMA_20'] > latest['EMA_50'])
+            bearish_trend = bool(latest['EMA_20'] < latest['EMA_50'])
         
         # Detect MACD crossovers
-        macd_crossed_up = (latest[macd_col] > latest[macd_signal_col] and
-                          previous[macd_col] <= previous[macd_signal_col])
+        macd_crossed_up = bool(latest[macd_col] > latest[macd_signal_col]) and bool(previous[macd_col] <= previous[macd_signal_col])
         
-        macd_crossed_down = (latest[macd_col] < latest[macd_signal_col] and
-                            previous[macd_col] >= previous[macd_signal_col])
+        macd_crossed_down = bool(latest[macd_col] < latest[macd_signal_col]) and bool(previous[macd_col] >= previous[macd_signal_col])
         
         # Volume confirmation with HIGHER threshold (2.5x instead of 1.5x)
-        volume_high = latest['Volume'] > latest['Volume_MA'] * 2.5
+        volume_high = bool(latest['Volume'] > latest['Volume_MA'] * 2.5)
         
         # Check BUY conditions - IMPROVED LOGIC
         buy_score = 0
         buy_reasons = []
         
         # CRITICAL FIX: Buy pullback to middle BB, NOT extension above upper BB
-        price_near_middle_bb = abs(latest['Close'] - latest[middle_bb_col]) / latest['Close'] < 0.015  # Within 1.5%
+        price_near_middle_bb = bool(abs(latest['Close'] - latest[middle_bb_col]) / latest['Close'] < 0.015)  # Within 1.5%
         if price_near_middle_bb and bullish_trend:
             buy_score += 2
             buy_reasons.append("Pullback to middle BB in uptrend")
@@ -181,7 +181,7 @@ class MomentumStrategy(BaseStrategy):
             buy_reasons.append("MACD bullish crossover")
         
         # RSI confirmation (momentum building, not overbought)
-        rsi_in_momentum_zone = 50 < latest[rsi_col] < 75
+        rsi_in_momentum_zone = bool(50 < latest[rsi_col] < 75)
         if rsi_in_momentum_zone:
             buy_score += 1
             buy_reasons.append(f"RSI confirming momentum ({latest[rsi_col]:.1f})")
@@ -213,18 +213,18 @@ class MomentumStrategy(BaseStrategy):
         
         # ADX falling (trend weakening)
         if adx_col in df.columns and len(df) > 3:
-            adx_falling = latest[adx_col] < df.iloc[-3][adx_col]
+            adx_falling = bool(latest[adx_col] < df.iloc[-3][adx_col])
             if adx_falling:
                 sell_score += 1
                 sell_reasons.append("ADX falling, trend weakening")
         
         # RSI momentum lost
-        if latest[rsi_col] < 40:
+        if bool(latest[rsi_col] < 40):
             sell_score += 1
             sell_reasons.append(f"RSI momentum lost ({latest[rsi_col]:.1f})")
         
         # Price below middle BB
-        price_below_middle = latest['Close'] < latest[middle_bb_col]
+        price_below_middle = bool(latest['Close'] < latest[middle_bb_col])
         if price_below_middle:
             sell_score += 1
             sell_reasons.append("Price below middle BB")

@@ -804,15 +804,53 @@ class TradingBot:
                     df = self.api.get_historical_data(product_id, granularity, periods)
                     
                     if df.empty or len(df) < 50:
+                        logger.info(f"[SCAN] {product_id:15s} - Insufficient data (< 50 candles)")
                         return None
+                    
+                    # Add indicators first so we can display them
+                    df = self.strategy.add_indicators(df)
                     
                     # Get signal
                     signal = self.strategy.analyze(df, product_id)
+                    latest_price = df['Close'].iloc[-1]
+                    
+                    # Extract key indicators for display (check what columns actually exist)
+                    adx = None
+                    rsi = None
+                    
+                    # Try to find ADX column
+                    adx_cols = [col for col in df.columns if 'ADX' in col]
+                    if adx_cols:
+                        adx = df[adx_cols[0]].iloc[-1]
+                    
+                    # Try to find RSI column
+                    rsi_cols = [col for col in df.columns if 'RSI' in col]
+                    if rsi_cols:
+                        rsi = df[rsi_cols[0]].iloc[-1]
+                    
+                    # Build indicator string
+                    indicators = ""
+                    if adx is not None and rsi is not None:
+                        indicators = f"ADX:{adx:5.1f} RSI:{rsi:5.1f}"
+                    elif adx is not None:
+                        indicators = f"ADX:{adx:5.1f}"
+                    elif rsi is not None:
+                        indicators = f"RSI:{rsi:5.1f}"
+                    
+                    # Log each product scan with details
+                    if signal.action == 'BUY':
+                        confidence_pct = f"{signal.confidence:.1%}"
+                        reason = getattr(signal, 'reason', signal.metadata.get('reason', ''))
+                        logger.info(f"[SCAN] {product_id:15s} - BUY {confidence_pct:>6s} @ ${latest_price:>10.4f} | {indicators} | {reason}")
+                    elif signal.action == 'SELL':
+                        reason = getattr(signal, 'reason', signal.metadata.get('reason', ''))
+                        logger.info(f"[SCAN] {product_id:15s} - SELL      @ ${latest_price:>10.4f} | {indicators} | {reason}")
+                    else:
+                        # For HOLD, show indicators
+                        logger.info(f"[SCAN] {product_id:15s} - HOLD      @ ${latest_price:>10.4f} | {indicators}")
                     
                     # Only return BUY signals above minimum confidence
                     if signal.action == 'BUY' and signal.confidence >= min_confidence:
-                        latest_price = df['Close'].iloc[-1]
-                        
                         return {
                             'product_id': product_id,
                             'signal': signal.action,
@@ -822,7 +860,7 @@ class TradingBot:
                         }
                     
                 except Exception as e:
-                    logger.debug(f"Error analyzing {product_id}: {e}")
+                    logger.warning(f"[SCAN] {product_id:15s} - Error: {e}")
                     
                 return None
             
