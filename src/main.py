@@ -20,6 +20,7 @@ import sys
 import time
 import logging
 import signal
+import json
 from pathlib import Path
 from decimal import Decimal
 from datetime import datetime, UTC
@@ -453,6 +454,26 @@ class TradingBot:
                 return
             
             order_id = limit_order['order_id']
+            logger.info(f"Limit order placed: {order_id}")
+            
+            # Save order to database with 'submitted' status
+            self.db.insert_order({
+                'client_order_id': order_id,
+                'product_id': product_id,
+                'side': 'BUY',
+                'order_type': 'limit_gtc_post_only',
+                'status': 'submitted',
+                'base_size': actual_size,
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'metadata': {
+                    'signal': signal_metadata,
+                    'sizing': sizing_metadata,
+                    'post_only': True,
+                    'submitted_at': datetime.utcnow().isoformat()
+                }
+            })
             
             # Monitor order for fill (wait up to 30 seconds)
             logger.info(f"Monitoring limit order {order_id} for fill...")
@@ -467,8 +488,28 @@ class TradingBot:
                     break
             
             if not filled:
-                logger.warning(f"Limit order not filled within 30s - consider adjusting price")
-                # Could implement price adjustment logic here
+                logger.warning(f"Limit order {order_id} not filled within 30s - cancelling to prevent ghost order")
+                
+                # CRITICAL: Cancel the order to prevent it from becoming a ghost order
+                try:
+                    cancel_result = self.api.cancel_order(order_id)
+                    if cancel_result:
+                        logger.info(f"Successfully cancelled unfilled order: {order_id}")
+                        
+                        # Update order status in database
+                        cursor = self.db.conn.cursor()
+                        cursor.execute(
+                            "UPDATE orders SET status = 'cancelled', metadata = json_set(metadata, '$.cancelled_at', ?) WHERE client_order_id = ?",
+                            (datetime.utcnow().isoformat(), order_id)
+                        )
+                        self.db.conn.commit()
+                    else:
+                        logger.error(f"Failed to cancel order {order_id} - GHOST ORDER RISK!")
+                        logger.error("This order may fill later without the bot's knowledge!")
+                except Exception as e:
+                    logger.error(f"Exception while cancelling order {order_id}: {e}")
+                    logger.error("CRITICAL: Ghost order may exist on exchange!")
+                
                 return
             
             # Get actual fill details
@@ -654,9 +695,131 @@ class TradingBot:
             
             logger.info(f"[PAPER] SELL order executed: {order_id}")
         else:
-            # Live trading
-            logger.critical("LIVE TRADING NOT YET IMPLEMENTED")
-            pass
+            # Live trading: Place market sell order
+            logger.info("Placing live market SELL order...")
+            
+            # First, cancel any open SL/TP orders for this position
+            metadata = position.get('metadata', {})
+            stop_order_id = metadata.get('stop_order_id')
+            tp_order_id = metadata.get('tp_order_id')
+            
+            cancelled_orders = []
+            if stop_order_id:
+                try:
+                    cancel_result = self.api.cancel_order(stop_order_id)
+                    if cancel_result:
+                        logger.info(f"Cancelled stop-loss order: {stop_order_id}")
+                        cancelled_orders.append(stop_order_id)
+                except Exception as e:
+                    logger.warning(f"Could not cancel stop-loss order {stop_order_id}: {e}")
+            
+            if tp_order_id:
+                try:
+                    cancel_result = self.api.cancel_order(tp_order_id)
+                    if cancel_result:
+                        logger.info(f"Cancelled take-profit order: {tp_order_id}")
+                        cancelled_orders.append(tp_order_id)
+                except Exception as e:
+                    logger.warning(f"Could not cancel take-profit order {tp_order_id}: {e}")
+            
+            # Place market sell order
+            sell_order = self.api.place_market_order(
+                product_id=product_id,
+                side='SELL',
+                size=float(position_size)
+            )
+            
+            if not sell_order:
+                logger.error(f"Failed to place market SELL order for {product_id}")
+                return
+            
+            order_id = sell_order['order_id']
+            logger.info(f"Market SELL order placed: {order_id}")
+            
+            # Wait for fill confirmation (market orders fill quickly)
+            import time
+            filled = False
+            actual_fill_price = current_price
+            actual_commission = Decimal('0')
+            
+            for i in range(10):  # Wait up to 10 seconds for market order fill
+                time.sleep(1)
+                order_status = self.api.get_order_status(order_id)
+                if order_status and order_status['status'] == 'FILLED':
+                    filled = True
+                    logger.info(f"Market SELL order filled: {order_id}")
+                    
+                    # Get actual fill details
+                    fills = self.api.get_fills(order_id=order_id)
+                    if fills:
+                        total_size = sum(Decimal(str(f['size'])) for f in fills)
+                        weighted_price = sum(Decimal(str(f['price'])) * Decimal(str(f['size'])) for f in fills)
+                        actual_fill_price = weighted_price / total_size if total_size > 0 else current_price
+                        actual_commission = sum(Decimal(str(f['commission'])) for f in fills)
+                        
+                        logger.info(f"Fill price: {actual_fill_price}, Commission: {actual_commission}")
+                    break
+            
+            if not filled:
+                logger.error(f"Market SELL order did not fill within 10 seconds: {order_id}")
+                logger.error("CRITICAL: Position may still be open on exchange but bot cannot confirm!")
+                return
+            
+            # Recalculate PnL with actual fill price
+            pnl = (actual_fill_price - entry_price) * position_size
+            pnl_percent = ((actual_fill_price - entry_price) / entry_price) * 100
+            
+            # Save sell order to database
+            self.db.insert_order({
+                'client_order_id': order_id,
+                'product_id': product_id,
+                'side': 'SELL',
+                'order_type': 'market',
+                'status': 'filled',
+                'base_size': position_size,
+                'filled_price': actual_fill_price,
+                'metadata': {
+                    'exit_reason': exit_reason,
+                    'fees_paid': float(actual_commission),
+                    'cancelled_orders': cancelled_orders,
+                    'paper_trade': False
+                }
+            })
+            
+            # Close position in database
+            self.db.close_position(product_id, float(actual_fill_price), float(pnl))
+            
+            # Record trade history
+            entry_time = position.get('opened_at')
+            exit_time = datetime.utcnow().isoformat()
+            
+            holding_time = None
+            if entry_time:
+                try:
+                    entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                    exit_dt = datetime.fromisoformat(exit_time.replace('Z', '+00:00'))
+                    holding_time = int((exit_dt - entry_dt).total_seconds())
+                except:
+                    pass
+            
+            self.db.insert_trade_history({
+                'product_id': product_id,
+                'side': 'BUY',  # Original entry side
+                'entry_price': entry_price,
+                'exit_price': actual_fill_price,
+                'size': position_size,
+                'pnl': pnl,
+                'pnl_percent': pnl_percent,
+                'entry_time': entry_time or datetime.utcnow().isoformat(),
+                'exit_time': exit_time,
+                'holding_time_seconds': holding_time,
+                'strategy': self.strategy.name,
+                'exit_reason': exit_reason
+            })
+            
+            logger.info(f"[LIVE] SELL order executed: {order_id}")
+            logger.info(f"[LIVE] PnL: ${pnl:.2f} ({pnl_percent:.2f}%)")
+            logger.info(f"[LIVE] Position closed for {product_id}")
     
     def _analyze_current_holdings(self, balances: Dict[str, Decimal]):
         """
@@ -893,6 +1056,176 @@ class TradingBot:
         
         return opportunities
     
+    def _check_open_orders(self):
+        """
+        Check status of all open/submitted orders and handle fills, cancellations, expirations.
+        This is the persistent order manager that runs in the main loop.
+        """
+        try:
+            # Get all submitted/open orders from database
+            cursor = self.db.conn.cursor()
+            cursor.execute("""
+                SELECT client_order_id, product_id, side, base_size, entry_price, 
+                       stop_loss, take_profit, metadata, created_at
+                FROM orders 
+                WHERE status IN ('submitted', 'open', 'pending')
+                ORDER BY created_at ASC
+            """)
+            
+            open_orders = cursor.fetchall()
+            
+            if not open_orders:
+                return  # No orders to check
+            
+            logger.debug(f"Checking status of {len(open_orders)} open orders...")
+            
+            for order_row in open_orders:
+                order_id = order_row[0]
+                product_id = order_row[1]
+                side = order_row[2]
+                base_size = Decimal(str(order_row[3]))
+                entry_price = Decimal(str(order_row[4]))
+                stop_loss = Decimal(str(order_row[5])) if order_row[5] else None
+                take_profit = Decimal(str(order_row[6])) if order_row[6] else None
+                metadata = json.loads(order_row[7]) if order_row[7] else {}
+                created_at = order_row[8]
+                
+                # Check if order has timed out (5 minutes for limit orders)
+                try:
+                    created_time = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    age_seconds = (datetime.now(UTC) - created_time).total_seconds()
+                    
+                    if age_seconds > 300:  # 5 minutes timeout
+                        logger.warning(f"Order {order_id} has timed out ({age_seconds:.0f}s) - cancelling")
+                        
+                        try:
+                            cancel_result = self.api.cancel_order(order_id)
+                            if cancel_result:
+                                logger.info(f"Cancelled timed-out order: {order_id}")
+                                cursor = self.db.conn.cursor()
+                                cursor.execute(
+                                    "UPDATE orders SET status = 'cancelled', metadata = json_set(metadata, '$.timeout_cancelled', ?) WHERE client_order_id = ?",
+                                    (datetime.utcnow().isoformat(), order_id)
+                                )
+                                self.db.conn.commit()
+                        except Exception as e:
+                            logger.error(f"Failed to cancel timed-out order {order_id}: {e}")
+                        
+                        continue
+                except Exception as e:
+                    logger.debug(f"Could not parse order timestamp: {e}")
+                
+                # Query API for current order status
+                try:
+                    order_status = self.api.get_order_status(order_id)
+                    
+                    if not order_status:
+                        logger.warning(f"Could not get status for order {order_id}")
+                        continue
+                    
+                    api_status = order_status['status']
+                    
+                    # Handle different statuses
+                    if api_status == 'FILLED':
+                        logger.info(f"Order {order_id} ({side} {product_id}) has FILLED!")
+                        
+                        # Get fill details
+                        fills = self.api.get_fills(order_id=order_id)
+                        actual_fill_price = entry_price
+                        actual_commission = Decimal('0')
+                        
+                        if fills:
+                            total_size = sum(Decimal(str(f['size'])) for f in fills)
+                            weighted_price = sum(Decimal(str(f['price'])) * Decimal(str(f['size'])) for f in fills)
+                            actual_fill_price = weighted_price / total_size if total_size > 0 else entry_price
+                            actual_commission = sum(Decimal(str(f['commission'])) for f in fills)
+                        
+                        # Update order in database
+                        cursor = self.db.conn.cursor()
+                        cursor.execute(
+                            """UPDATE orders SET status = 'filled', filled_price = ?, 
+                               metadata = json_set(metadata, '$.filled_at', ?, '$.actual_commission', ?) 
+                               WHERE client_order_id = ?""",
+                            (float(actual_fill_price), datetime.utcnow().isoformat(), float(actual_commission), order_id)
+                        )
+                        self.db.conn.commit()
+                        
+                        # If this was a BUY order, create the position and bracket orders
+                        if side == 'BUY':
+                            logger.info(f"Creating position for {product_id}...")
+                            
+                            # Create stop-loss and take-profit orders
+                            stop_order = None
+                            tp_order = None
+                            
+                            if stop_loss:
+                                logger.info(f"Creating stop-loss order at ${stop_loss}...")
+                                stop_order = self.api.create_stop_limit_order(
+                                    product_id=product_id,
+                                    side='SELL',
+                                    base_size=float(base_size),
+                                    limit_price=float(stop_loss * Decimal('0.99')),
+                                    stop_price=float(stop_loss)
+                                )
+                            
+                            if take_profit:
+                                logger.info(f"Creating take-profit order at ${take_profit}...")
+                                tp_order = self.api.place_limit_order_gtc(
+                                    product_id=product_id,
+                                    side='SELL',
+                                    price=float(take_profit),
+                                    size=float(base_size),
+                                    post_only=False
+                                )
+                            
+                            # Create position in database
+                            self.db.insert_position({
+                                'product_id': product_id,
+                                'base_size': base_size,
+                                'entry_price': actual_fill_price,
+                                'current_price': actual_fill_price,
+                                'stop_loss': stop_loss,
+                                'take_profit': take_profit,
+                                'entry_order_id': order_id,
+                                'metadata': {
+                                    **metadata,
+                                    'fees_paid': float(actual_commission),
+                                    'stop_order_id': stop_order['order_id'] if stop_order else None,
+                                    'tp_order_id': tp_order['order_id'] if tp_order else None
+                                }
+                            })
+                            
+                            logger.info(f"Position opened for {product_id} at ${actual_fill_price}")
+                        
+                        elif side == 'SELL':
+                            # This was an exit order (SL/TP) - position is already closed
+                            logger.info(f"Exit order filled for {product_id} at ${actual_fill_price}")
+                    
+                    elif api_status in ['CANCELLED', 'EXPIRED']:
+                        logger.info(f"Order {order_id} is {api_status}")
+                        cursor = self.db.conn.cursor()
+                        cursor.execute(
+                            "UPDATE orders SET status = ? WHERE client_order_id = ?",
+                            (api_status.lower(), order_id)
+                        )
+                        self.db.conn.commit()
+                    
+                    elif api_status in ['OPEN', 'PENDING']:
+                        # Still waiting - update status if needed
+                        cursor = self.db.conn.cursor()
+                        cursor.execute(
+                            "UPDATE orders SET status = ? WHERE client_order_id = ?",
+                            (api_status.lower(), order_id)
+                        )
+                        self.db.conn.commit()
+                    
+                except Exception as e:
+                    logger.error(f"Error checking order {order_id}: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Error in _check_open_orders: {e}", exc_info=True)
+    
     def run(self):
         """Main trading loop."""
         global shutdown_requested
@@ -944,6 +1277,10 @@ class TradingBot:
                         logger.info(f"Today's Fees: ${fee_summary['total_fees']:.2f}, "
                                    f"Volume: ${fee_summary['total_volume']:.2f}")
                     last_fee_check = current_date
+                
+                # CRITICAL: Check status of all open orders (persistent order management)
+                logger.info("Checking open orders status...")
+                self._check_open_orders()
                 
                 # Get current balances
                 balances = self.api.get_account_balances(

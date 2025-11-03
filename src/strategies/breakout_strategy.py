@@ -211,13 +211,3 @@ class BreakoutStrategy(BaseStrategy):
                            metadata={'in_consolidation': in_consolidation,
                                    'bb_squeeze': bb_squeeze,
                                    'range_pct': latest['Range_Pct']})
-        
-        if sell_score >= 3:
-            confidence = min(sell_score / 5.0, 1.0)
-            logger.info(f"SELL signal for {product_id}: {', '.join(sell_reasons)}")
-            return TradingSignal('SELL', confidence=confidence,
-                               metadata={'reasons': sell_reasons, 'score': sell_score})
-        
-        return TradingSignal('HOLD', confidence=0.5,
-                           metadata={'range_pct': latest['Range_Pct'],
-                                   'close': latest['Close']})

@@ -28,7 +28,7 @@ trading:
   min_signal_confidence: 0.50
   
   # IMPORTANT: Set to false for live trading
-  paper_trading_mode: true
+  paper_trading_mode: false
 
 # Risk Management
 risk_management:
