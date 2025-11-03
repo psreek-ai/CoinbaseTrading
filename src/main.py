@@ -1018,14 +1018,15 @@ class TradingBot:
                         # For HOLD, show indicators
                         logger.info(f"[SCAN] {product_id:15s} - HOLD      @ ${latest_price:>10.4f} | {indicators}")
                     
-                    # Only return BUY signals above minimum confidence
-                    if signal.action == 'BUY' and signal.confidence >= min_confidence:
+                    # Return ALL BUY signals (both above and below threshold) for tracking
+                    if signal.action == 'BUY':
                         return {
                             'product_id': product_id,
                             'signal': signal.action,
                             'confidence': signal.confidence,
                             'price': latest_price,
-                            'metadata': signal.metadata
+                            'metadata': signal.metadata,
+                            'above_threshold': signal.confidence >= min_confidence
                         }
                     
                 except Exception as e:
@@ -1039,6 +1040,8 @@ class TradingBot:
                           for product_id in all_products}
                 
                 completed = 0
+                all_buy_signals = []  # Track ALL BUY signals for top 3 logging
+                
                 for future in as_completed(futures):
                     if shutdown_requested:
                         logger.info("Shutdown requested, stopping scan...")
@@ -1050,12 +1053,23 @@ class TradingBot:
                     
                     result = future.result()
                     if result:
-                        opportunities.append(result)
+                        all_buy_signals.append(result)
+                        if result['above_threshold']:
+                            opportunities.append(result)
             
-            # Sort by confidence
+            # Sort all BUY signals by confidence
+            all_buy_signals.sort(key=lambda x: x['confidence'], reverse=True)
+            self._top_buy_signals = all_buy_signals[:3]  # Store top 3 for logging
+            
+            logger.debug(f"Total BUY signals found: {len(all_buy_signals)}")
+            
+            # Sort opportunities (above threshold) by confidence
             opportunities.sort(key=lambda x: x['confidence'], reverse=True)
             
             logger.info(f"Scan complete: Found {len(opportunities)} opportunities above {min_confidence:.0%} confidence")
+            if len(all_buy_signals) > 0:
+                logger.info(f"(Total BUY signals including below threshold: {len(all_buy_signals)})")
+
             
         except Exception as e:
             logger.error(f"Error in product scan: {e}", exc_info=True)
@@ -1445,6 +1459,18 @@ class TradingBot:
                             logger.info(f"  {opp['product_id']}: {opp['signal']} (confidence: {opp['confidence']:.2f})")
                     else:
                         logger.info("No strong BUY opportunities found at this time.")
+                        
+                        # Show top 3 candidates even though they didn't meet threshold
+                        if hasattr(self, '_top_buy_signals') and self._top_buy_signals:
+                            threshold = self.config.get('trading.min_signal_confidence', 0.5)
+                            logger.info(f"Top {len(self._top_buy_signals)} BUY candidates (below {threshold:.0%} threshold):")
+                            for i, signal in enumerate(self._top_buy_signals[:3], 1):
+                                reason = signal['metadata'].get('reason', 'momentum signal')
+                                logger.info(f"  #{i} {signal['product_id']:15s} @ ${signal['price']:>10.4f} | "
+                                          f"Confidence: {signal['confidence']:.1%} | {reason}")
+                        else:
+                            logger.info("No BUY signals detected at all (market conditions unfavorable)")
+                        
                 except Exception as e:
                     logger.error(f"Error during full market scan: {e}")
                 
