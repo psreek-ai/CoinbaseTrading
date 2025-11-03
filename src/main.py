@@ -251,10 +251,42 @@ class TradingBot:
             logger.warning("Cannot calculate total equity")
             return
         
-        # Get entry price
-        entry_price = self.api.get_latest_price(product_id)
-        if not entry_price:
-            logger.warning(f"No price available for {product_id}")
+        # Get entry price with best bid/ask analysis
+        bid_ask = self.api.get_best_bid_ask([product_id])
+        
+        if bid_ask and product_id in bid_ask:
+            best_ask = bid_ask[product_id]['best_ask']
+            spread = bid_ask[product_id]['spread']
+            spread_pct = bid_ask[product_id]['spread_pct']
+            
+            # Check if spread is reasonable
+            max_spread_pct = 0.5  # 0.5% max spread
+            if spread_pct and spread_pct > max_spread_pct:
+                logger.warning(f"Spread too wide ({spread_pct:.2f}% > {max_spread_pct}%), skipping entry")
+                return
+            
+            # Place limit order slightly better than best ask (try to earn maker rebate)
+            tick_size = Decimal('0.01')  # Adjust based on product
+            entry_price = best_ask - tick_size if best_ask else self.api.get_latest_price(product_id)
+            
+            logger.info(f"Spread analysis: Best Ask=${best_ask}, Spread={spread_pct:.3f}%, Entry=${entry_price}")
+        else:
+            # Fallback to latest price if bid/ask not available
+            entry_price = self.api.get_latest_price(product_id)
+            if not entry_price:
+                logger.warning(f"No price available for {product_id}")
+                return
+        
+        # Analyze volume flow for confirmation
+        volume_flow = self.api.analyze_volume_flow(product_id, lookback_trades=100)
+        buy_pressure = volume_flow.get('buy_pressure', 0.5)
+        net_pressure = volume_flow.get('net_pressure', 'neutral')
+        
+        logger.info(f"Volume flow: {buy_pressure:.1%} buy pressure ({net_pressure})")
+        
+        # Require moderate buy pressure for entry
+        if buy_pressure < 0.45:
+            logger.warning(f"Insufficient buy pressure ({buy_pressure:.1%}), skipping entry")
             return
         
         # Calculate stop loss and take profit
@@ -337,15 +369,15 @@ class TradingBot:
         logger.info("=" * 60)
         
         if self.paper_trading:
-            # Paper trading: Simulate bracket order
-            order_id = f"PAPER_{datetime.now().strftime('%Y%m%d%H%M%S')}_{product_id}"
+            # Paper trading: Simulate limit order with post-only
+            order_id = f"PAPER_LIMIT_{datetime.now().strftime('%Y%m%d%H%M%S')}_{product_id}"
             
             # Save to database with preview data
             self.db.insert_order({
                 'client_order_id': order_id,
                 'product_id': product_id,
                 'side': 'BUY',
-                'order_type': 'bracket',
+                'order_type': 'limit_gtc_post_only',
                 'status': 'filled',
                 'base_size': actual_size,
                 'entry_price': actual_entry_price,
@@ -359,8 +391,15 @@ class TradingBot:
                         'slippage': float(slippage_percent),
                         'fee_percent': float(fee_percent)
                     },
+                    'volume_flow': {
+                        'buy_pressure': float(buy_pressure),
+                        'net_pressure': net_pressure
+                    },
+                    'spread_analysis': {
+                        'spread_pct': spread_pct if 'spread_pct' in locals() else None
+                    },
                     'paper_trade': True,
-                    'bracket_order': True  # Flag that this simulates bracket order
+                    'post_only': True  # Flag that this earns maker rebates
                 }
             })
             
@@ -395,36 +434,68 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"Could not start WebSocket: {e}")
             
-            logger.info(f"[PAPER] Bracket order simulated: {order_id}")
+            logger.info(f"[PAPER] Limit order (post-only) simulated: {order_id}")
             
         else:
-            # Live trading: Create actual bracket order at exchange
-            logger.info("Creating live bracket order at exchange...")
+            # Live trading: Place limit order with post-only for maker rebates
+            logger.info("Placing live limit order with post-only (earning maker rebates)...")
             
-            bracket_order = self.api.create_bracket_order(
+            limit_order = self.api.place_limit_order_gtc(
                 product_id=product_id,
                 side='BUY',
-                base_size=actual_size,
-                limit_price=actual_entry_price,
-                stop_loss_price=stop_loss,
-                take_profit_price=take_profit
+                price=entry_price,
+                size=actual_size,
+                post_only=True  # CRITICAL: Ensures maker order (earns rebates)
             )
             
-            if not bracket_order:
-                logger.error("Failed to create bracket order")
+            if not limit_order:
+                logger.error("Failed to place limit order")
                 return
             
-            order_id = bracket_order['order_id']
+            order_id = limit_order['order_id']
+            
+            # Monitor order for fill (wait up to 30 seconds)
+            logger.info(f"Monitoring limit order {order_id} for fill...")
+            import time
+            filled = False
+            for i in range(30):
+                time.sleep(1)
+                order_status = self.api.get_order_status(order_id)
+                if order_status and order_status['status'] in ['FILLED', 'CANCELLED', 'EXPIRED']:
+                    filled = order_status['status'] == 'FILLED'
+                    logger.info(f"Order {order_id} status: {order_status['status']}")
+                    break
+            
+            if not filled:
+                logger.warning(f"Limit order not filled within 30s - consider adjusting price")
+                # Could implement price adjustment logic here
+                return
+            
+            # Get actual fill details
+            fills = self.api.get_fills(order_id=order_id)
+            actual_fill_price = entry_price
+            actual_commission = Decimal('0')
+            
+            if fills:
+                # Calculate average fill price and total commission
+                total_size = sum(f['size'] for f in fills)
+                weighted_price = sum(f['price'] * f['size'] for f in fills)
+                actual_fill_price = weighted_price / total_size if total_size > 0 else entry_price
+                actual_commission = sum(f['commission'] for f in fills)
+                
+                # Log maker/taker status
+                maker_count = sum(1 for f in fills if f.get('liquidity_indicator') == 'MAKER')
+                logger.info(f"Fill details: {maker_count}/{len(fills)} fills were MAKER (earning rebates)")
             
             # Save to database
             self.db.insert_order({
                 'client_order_id': order_id,
                 'product_id': product_id,
                 'side': 'BUY',
-                'order_type': 'bracket',
-                'status': bracket_order['status'],
+                'order_type': 'limit_gtc_post_only',
+                'status': 'filled',
                 'base_size': actual_size,
-                'entry_price': actual_entry_price,
+                'entry_price': actual_fill_price,
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'metadata': {
@@ -435,25 +506,51 @@ class TradingBot:
                         'slippage': float(slippage_percent),
                         'fee_percent': float(fee_percent)
                     },
+                    'actual_fills': {
+                        'commission': float(actual_commission),
+                        'avg_price': float(actual_fill_price),
+                        'num_fills': len(fills) if fills else 0
+                    },
                     'live_trade': True,
-                    'bracket_order': True
+                    'post_only': True
                 }
             })
             
-            # Open position
+            # Now create stop-loss and take-profit orders
+            logger.info(f"Creating stop-loss order at ${stop_loss}...")
+            stop_order = self.api.create_stop_limit_order(
+                product_id=product_id,
+                side='SELL',
+                base_size=actual_size,
+                limit_price=stop_loss * Decimal('0.99'),  # Limit slightly below stop
+                stop_price=stop_loss
+            )
+            
+            logger.info(f"Creating take-profit order at ${take_profit}...")
+            tp_order = self.api.place_limit_order_gtc(
+                product_id=product_id,
+                side='SELL',
+                price=take_profit,
+                size=actual_size,
+                post_only=False  # Take profit can be taker
+            )
+            
+            # Open position with actual fill price
             self.db.insert_position({
                 'product_id': product_id,
                 'base_size': actual_size,
-                'entry_price': actual_entry_price,
-                'current_price': actual_entry_price,
+                'entry_price': actual_fill_price,
+                'current_price': actual_fill_price,
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'entry_order_id': order_id,
                 'metadata': {
                     'strategy': self.strategy.name,
                     'signal': signal_metadata,
-                    'fees_paid': float(preview['commission_total']),
-                    'bracket_order': True
+                    'fees_paid': float(actual_commission),
+                    'stop_order_id': stop_order['order_id'] if stop_order else None,
+                    'tp_order_id': tp_order['order_id'] if tp_order else None,
+                    'post_only_entry': True
                 }
             })
             

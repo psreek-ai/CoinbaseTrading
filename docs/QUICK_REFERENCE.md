@@ -1,5 +1,7 @@
 # 🚀 Quick Reference Guide
 
+**Last Updated**: November 3, 2025 (Optimization Release)
+
 ## Essential Commands
 
 ### Trading Bot
@@ -13,6 +15,14 @@ python run.py
 # Stop the bot
 Ctrl + C
 ```
+
+**What to Watch For in Logs:**
+- `"ADX falling, trend weakening"` - Filtering ranging markets
+- `"EMA bullish alignment"` - Trend confirmation
+- `"Spread analysis: Best Ask=$X, Spread=0.2%"` - Pre-trade checks
+- `"Volume flow: 65% buy pressure (strong_buy)"` - Volume confirmation
+- `"[PAPER] Limit order (post-only) simulated"` - Maker order execution
+- `"Pullback to middle BB in uptrend"` - Improved momentum entry
 
 ### Market Scanner
 ```powershell
@@ -37,8 +47,9 @@ python run.py convert
 # Open database
 sqlite3 data/trading_bot.db
 
-# Recent trades
-SELECT product_id, side, entry_price, exit_price, pnl, pnl_percent 
+# Recent trades with maker/taker info
+SELECT product_id, side, entry_price, exit_price, pnl, pnl_percent, 
+       order_metadata->>'$.maker_fills' as maker_count
 FROM trade_history 
 ORDER BY exit_time DESC 
 LIMIT 10;
@@ -61,17 +72,17 @@ WHERE status = 'open';
 ```yaml
 # config/config.yaml
 trading:
-  paper_trading_mode: true   # Safe testing
-  paper_trading_mode: false  # 🔴 REAL MONEY!
+  paper_trading_mode: true   # ✅ Safe testing (RECOMMENDED for new optimizations)
+  paper_trading_mode: false  # 🔴 REAL MONEY! (Only after 24-48hr paper testing)
 ```
 
 ### Change Strategy
 ```yaml
 strategies:
-  active_strategy: "momentum"        # Trending markets
-  active_strategy: "mean_reversion"  # Range-bound
-  active_strategy: "breakout"        # Consolidation
-  active_strategy: "hybrid"          # Conservative
+  active_strategy: "momentum"        # Trending markets (NOW: with ADX >25 filter)
+  active_strategy: "mean_reversion"  # Range-bound (NOW: with Stochastic + EMA 200)
+  active_strategy: "breakout"        # Consolidation (NOW: with 50-bar lookback)
+  active_strategy: "hybrid"          # Conservative (all improvements)
 ```
 
 ### Adjust Risk
@@ -80,6 +91,8 @@ risk_management:
   risk_percent_per_trade: 0.01  # 1% risk per trade
   max_position_size_percent: 0.10  # 10% max per position
   max_drawdown_percent: 0.15  # Stop at 15% loss
+  max_spread_percent: 0.005   # NEW: Reject if spread >0.5%
+  min_buy_pressure: 0.45      # NEW: Require 45% buy volume
 ```
 
 ### Signal Confidence
@@ -93,7 +106,7 @@ trading:
 ```yaml
 trading:
   candle_granularity: "FIVE_MINUTE"     # 5min candles
-  candle_granularity: "FIFTEEN_MINUTE"  # 15min candles
+  candle_granularity: "FIFTEEN_MINUTE"  # 15min candles (RECOMMENDED)
   candle_granularity: "ONE_HOUR"        # 1hr candles
 ```
 

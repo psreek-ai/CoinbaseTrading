@@ -46,8 +46,14 @@ class MeanReversionStrategy(BaseStrategy):
             # RSI
             df.ta.rsi(length=self.rsi_period, append=True)
             
+            # Stochastic Oscillator - CRITICAL for timing
+            df.ta.stoch(length=14, append=True)
+            
             # Simple Moving Average
             df['SMA'] = df['Close'].rolling(window=self.mean_lookback).mean()
+            
+            # EMA 200 for long-term trend filter
+            df['EMA_200'] = df.ta.ema(length=200)
             
             # Calculate distance from mean (as percentage)
             df['Distance_From_Mean'] = ((df['Close'] - df['SMA']) / df['SMA']) * 100
@@ -60,7 +66,7 @@ class MeanReversionStrategy(BaseStrategy):
         return df
     
     def analyze(self, df: pd.DataFrame, product_id: str) -> TradingSignal:
-        """Analyze data and generate mean reversion signal."""
+        """Analyze data and generate mean reversion signal with improved filters."""
         
         if not self.validate_data(df, min_periods=self.mean_lookback):
             return TradingSignal('HOLD', confidence=0.0)
@@ -77,9 +83,16 @@ class MeanReversionStrategy(BaseStrategy):
         upper_bb_col = f'BBU_{self.bb_period}_{self.bb_std}'
         lower_bb_col = f'BBL_{self.bb_period}_{self.bb_std}'
         rsi_col = f'RSI_{self.rsi_period}'
+        stoch_k_col = 'STOCHk_14_3_3'  # Stochastic %K
+        stoch_d_col = 'STOCHd_14_3_3'  # Stochastic %D
         
         if not all(col in df.columns for col in [upper_bb_col, lower_bb_col, rsi_col]):
             return TradingSignal('HOLD', confidence=0.0)
+        
+        # CRITICAL FILTER: Only buy reversions in long-term uptrend
+        in_uptrend = True
+        if 'EMA_200' in df.columns:
+            in_uptrend = latest['Close'] > latest['EMA_200']
         
         # BUY conditions (oversold - expecting bounce)
         buy_score = 0
@@ -98,6 +111,18 @@ class MeanReversionStrategy(BaseStrategy):
             buy_score += 1
             buy_reasons.append(f"RSI oversold ({latest[rsi_col]:.1f})")
         
+        # Stochastic oversold and crossing up
+        if stoch_k_col in df.columns and stoch_d_col in df.columns:
+            stoch_oversold = latest[stoch_k_col] < 20
+            stoch_crossing_up = latest[stoch_k_col] > latest[stoch_d_col] and previous[stoch_k_col] <= previous[stoch_d_col]
+            
+            if stoch_oversold and stoch_crossing_up:
+                buy_score += 2
+                buy_reasons.append(f"Stochastic oversold + bullish cross ({latest[stoch_k_col]:.1f})")
+            elif stoch_oversold:
+                buy_score += 1
+                buy_reasons.append("Stochastic oversold")
+        
         # Price significantly below mean
         if latest['Distance_From_Mean'] < -5:  # More than 5% below mean
             buy_score += 1
@@ -108,8 +133,15 @@ class MeanReversionStrategy(BaseStrategy):
             buy_score += 1
             buy_reasons.append("Bouncing from lower BB")
         
-        if buy_score >= 3:
-            confidence = min(buy_score / 5.0, 1.0)
+        # CRITICAL: Only buy if in long-term uptrend
+        if not in_uptrend:
+            buy_score = max(0, buy_score - 3)  # Heavily penalize counter-trend
+            buy_reasons.append("⚠️ Below EMA 200 (downtrend)")
+        else:
+            buy_reasons.append("✓ Above EMA 200 (uptrend)")
+        
+        if buy_score >= 4:
+            confidence = min(buy_score / 7.0, 1.0)
             logger.info(f"BUY signal for {product_id}: {', '.join(buy_reasons)}")
             return TradingSignal('BUY', confidence=confidence,
                                metadata={'reasons': buy_reasons, 'score': buy_score})
@@ -131,6 +163,18 @@ class MeanReversionStrategy(BaseStrategy):
             sell_score += 1
             sell_reasons.append(f"RSI overbought ({latest[rsi_col]:.1f})")
         
+        # Stochastic overbought and crossing down
+        if stoch_k_col in df.columns and stoch_d_col in df.columns:
+            stoch_overbought = latest[stoch_k_col] > 80
+            stoch_crossing_down = latest[stoch_k_col] < latest[stoch_d_col] and previous[stoch_k_col] >= previous[stoch_d_col]
+            
+            if stoch_overbought and stoch_crossing_down:
+                sell_score += 2
+                sell_reasons.append(f"Stochastic overbought + bearish cross ({latest[stoch_k_col]:.1f})")
+            elif stoch_overbought:
+                sell_score += 1
+                sell_reasons.append("Stochastic overbought")
+        
         # Price significantly above mean
         if latest['Distance_From_Mean'] > 5:  # More than 5% above mean
             sell_score += 1
@@ -142,7 +186,7 @@ class MeanReversionStrategy(BaseStrategy):
             sell_reasons.append("Rejecting from upper BB")
         
         if sell_score >= 3:
-            confidence = min(sell_score / 5.0, 1.0)
+            confidence = min(sell_score / 6.0, 1.0)
             logger.info(f"SELL signal for {product_id}: {', '.join(sell_reasons)}")
             return TradingSignal('SELL', confidence=confidence,
                                metadata={'reasons': sell_reasons, 'score': sell_score})

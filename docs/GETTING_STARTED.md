@@ -1,12 +1,12 @@
 # 🎯 GETTING STARTED - Complete Step-by-Step Guide
 
-Follow these steps exactly to get your trading bot running.
+Follow these steps exactly to get your optimized trading bot running.
 
 ## Prerequisites
 
 - ✅ Windows, macOS, or Linux computer
 - ✅ Python 3.9 or higher installed
-- ✅ Coinbase account
+- ✅ Coinbase account with API access
 - ✅ Internet connection
 - ✅ Basic command line knowledge
 
@@ -20,7 +20,7 @@ Open a terminal/command prompt and run:
 python --version
 ```
 
-**Expected output:** `Python 3.9.x` or higher
+**Expected output:** `Python 3.9.x` or higher (Python 3.12.4 recommended)
 
 ❌ If you get an error or version is too old:
 - Download Python from https://www.python.org/downloads/
@@ -49,6 +49,12 @@ source venv/bin/activate
 
 ✅ **Success indicator:** Your prompt should now show `(venv)` at the beginning
 
+💡 **Troubleshooting (Windows PowerShell):**
+If you get a "script execution disabled" error:
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
 ---
 
 ## Step 3: Install Dependencies
@@ -63,10 +69,10 @@ pip install -r requirements.txt
 This will install:
 - `python-dotenv` - Environment variable management
 - `pyyaml` - Configuration file handling
-- `coinbase-advanced-py` - Coinbase API SDK
+- `coinbase-advanced-py` (v1.8.2) - Coinbase API SDK
 - `pandas` - Data manipulation
 - `numpy` - Numerical computing
-- `pandas-ta` - Technical analysis indicators
+- `pandas-ta` - Technical analysis indicators (ADX, EMA, Stochastic, MACD, RSI, Bollinger Bands)
 
 ⏱️ **Time:** 2-5 minutes depending on internet speed
 
@@ -76,6 +82,8 @@ pip list
 ```
 
 You should see all the packages listed above.
+
+⚠️ **Note:** You may see deprecation warnings from `pandas_ta` - these are harmless and don't affect functionality.
 
 ---
 

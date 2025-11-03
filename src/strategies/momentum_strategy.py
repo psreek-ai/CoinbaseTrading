@@ -76,6 +76,22 @@ class MomentumStrategy(BaseStrategy):
             except Exception as e:
                 logger.debug(f"RSI calculation failed: {e}")
             
+            # ADX - CRITICAL: Trend strength indicator
+            try:
+                adx = df.ta.adx(length=14)
+                if adx is not None and not adx.empty:
+                    df = pd.concat([df, adx], axis=1)
+            except Exception as e:
+                logger.debug(f"ADX calculation failed: {e}")
+            
+            # EMA - Trend direction filters
+            try:
+                df['EMA_20'] = df.ta.ema(length=20)
+                df['EMA_50'] = df.ta.ema(length=50)
+                df['EMA_200'] = df.ta.ema(length=200)
+            except Exception as e:
+                logger.debug(f"EMA calculation failed: {e}")
+            
             # Volume moving average
             try:
                 df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
@@ -95,7 +111,7 @@ class MomentumStrategy(BaseStrategy):
         return df
     
     def analyze(self, df: pd.DataFrame, product_id: str) -> TradingSignal:
-        """Analyze data and generate momentum signal."""
+        """Analyze data and generate momentum signal with improved logic."""
         
         # Validate data
         if not self.validate_data(df):
@@ -118,6 +134,7 @@ class MomentumStrategy(BaseStrategy):
         macd_col = f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         macd_signal_col = f'MACDs_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         rsi_col = f'RSI_{self.rsi_period}'
+        adx_col = 'ADX_14'
         
         # Check for required columns
         required_cols = [upper_bb_col, middle_bb_col, lower_bb_col, 
@@ -126,6 +143,19 @@ class MomentumStrategy(BaseStrategy):
             logger.debug(f"Missing required indicators for {product_id} (insufficient data)")
             return TradingSignal('HOLD', confidence=0.0)
         
+        # CRITICAL FILTER: Only trade in strong trends (ADX > 25)
+        if adx_col in df.columns:
+            if latest[adx_col] < 25:
+                logger.debug(f"{product_id}: ADX too low ({latest[adx_col]:.1f}), market not trending")
+                return TradingSignal('HOLD', confidence=0.0)
+        
+        # CRITICAL FILTER: Confirm trend direction with EMAs
+        bullish_trend = True
+        bearish_trend = True
+        if 'EMA_20' in df.columns and 'EMA_50' in df.columns:
+            bullish_trend = latest['EMA_20'] > latest['EMA_50']
+            bearish_trend = latest['EMA_20'] < latest['EMA_50']
+        
         # Detect MACD crossovers
         macd_crossed_up = (latest[macd_col] > latest[macd_signal_col] and
                           previous[macd_col] <= previous[macd_signal_col])
@@ -133,57 +163,71 @@ class MomentumStrategy(BaseStrategy):
         macd_crossed_down = (latest[macd_col] < latest[macd_signal_col] and
                             previous[macd_col] >= previous[macd_signal_col])
         
-        # Volume confirmation
-        volume_high = latest['Volume'] > latest['Volume_MA'] * self.volume_threshold
+        # Volume confirmation with HIGHER threshold (2.5x instead of 1.5x)
+        volume_high = latest['Volume'] > latest['Volume_MA'] * 2.5
         
-        # Check BUY conditions
-        price_above_upper_bb = latest['Close'] > latest[upper_bb_col]
-        rsi_in_buy_zone = 50 < latest[rsi_col] < self.rsi_overbought
-        
+        # Check BUY conditions - IMPROVED LOGIC
         buy_score = 0
         buy_reasons = []
         
-        if price_above_upper_bb:
-            buy_score += 1
-            buy_reasons.append("Price above upper BB")
+        # CRITICAL FIX: Buy pullback to middle BB, NOT extension above upper BB
+        price_near_middle_bb = abs(latest['Close'] - latest[middle_bb_col]) / latest['Close'] < 0.015  # Within 1.5%
+        if price_near_middle_bb and bullish_trend:
+            buy_score += 2
+            buy_reasons.append("Pullback to middle BB in uptrend")
         
         if macd_crossed_up:
             buy_score += 2  # MACD crossover is stronger signal
             buy_reasons.append("MACD bullish crossover")
         
-        if rsi_in_buy_zone:
+        # RSI confirmation (momentum building, not overbought)
+        rsi_in_momentum_zone = 50 < latest[rsi_col] < 75
+        if rsi_in_momentum_zone:
             buy_score += 1
-            buy_reasons.append(f"RSI in momentum zone ({latest[rsi_col]:.1f})")
+            buy_reasons.append(f"RSI confirming momentum ({latest[rsi_col]:.1f})")
         
+        # IMPROVED: Higher volume threshold
         if volume_high:
             buy_score += 1
-            buy_reasons.append("High volume")
+            buy_reasons.append("Strong volume confirmation (>2.5x average)")
         
-        # BUY signal (need at least 3 points)
-        if buy_score >= 3:
-            confidence = min(buy_score / 5.0, 1.0)
+        # EMA trend alignment
+        if bullish_trend:
+            buy_score += 1
+            buy_reasons.append("EMA bullish alignment")
+        
+        # BUY signal (need at least 4 points for quality)
+        if buy_score >= 4:
+            confidence = min(buy_score / 6.0, 1.0)
             logger.info(f"BUY signal for {product_id}: {', '.join(buy_reasons)}")
             return TradingSignal('BUY', confidence=confidence, 
                                metadata={'reasons': buy_reasons, 'score': buy_score})
         
-        # Check SELL conditions
-        price_below_middle_bb = latest['Close'] < latest[middle_bb_col]
-        rsi_overbought = latest[rsi_col] > 75
-        
+        # Check SELL conditions - IMPROVED
         sell_score = 0
         sell_reasons = []
-        
-        if price_below_middle_bb:
-            sell_score += 2
-            sell_reasons.append("Price below middle BB")
         
         if macd_crossed_down:
             sell_score += 2
             sell_reasons.append("MACD bearish crossover")
         
-        if rsi_overbought:
+        # ADX falling (trend weakening)
+        if adx_col in df.columns and len(df) > 3:
+            adx_falling = latest[adx_col] < df.iloc[-3][adx_col]
+            if adx_falling:
+                sell_score += 1
+                sell_reasons.append("ADX falling, trend weakening")
+        
+        # RSI momentum lost
+        if latest[rsi_col] < 40:
             sell_score += 1
-            sell_reasons.append(f"RSI overbought ({latest[rsi_col]:.1f})")
+            sell_reasons.append(f"RSI momentum lost ({latest[rsi_col]:.1f})")
+        
+        # Price below middle BB
+        price_below_middle = latest['Close'] < latest[middle_bb_col]
+        if price_below_middle:
+            sell_score += 1
+            sell_reasons.append("Price below middle BB")
         
         # SELL signal (need at least 2 points)
         if sell_score >= 2:
@@ -195,4 +239,5 @@ class MomentumStrategy(BaseStrategy):
         # HOLD
         return TradingSignal('HOLD', confidence=0.5,
                            metadata={'latest_rsi': latest[rsi_col],
-                                   'latest_close': latest['Close']})
+                                   'latest_close': latest['Close'],
+                                   'adx': latest[adx_col] if adx_col in df.columns else None})

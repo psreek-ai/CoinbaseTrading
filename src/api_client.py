@@ -967,6 +967,293 @@ class CoinbaseAPI:
             logger.error(f"Error getting order status for {order_id}: {e}")
             return None
     
+    def get_best_bid_ask(self, product_ids: List[str]) -> Dict:
+        """
+        Get best bid/ask prices for multiple products simultaneously.
+        Critical for spread analysis and optimal limit order placement.
+        
+        Args:
+            product_ids: List of product IDs to get bid/ask for
+            
+        Returns:
+            Dictionary of {product_id: {'best_bid', 'best_ask', 'spread', 'spread_pct'}}
+        """
+        try:
+            # Apply rate limiting before API call
+            self._rate_limit()
+            
+            response = self.rest_client.get_best_bid_ask(product_ids=product_ids)
+            
+            if not response or not hasattr(response, 'pricebooks'):
+                logger.warning("No pricebooks in best bid/ask response")
+                return {}
+            
+            result = {}
+            for pricebook in response.pricebooks:
+                product_id = pricebook.product_id
+                
+                # Get best bid (highest buy price)
+                best_bid = None
+                if pricebook.bids and len(pricebook.bids) > 0:
+                    best_bid = Decimal(str(pricebook.bids[0].price))
+                
+                # Get best ask (lowest sell price)
+                best_ask = None
+                if pricebook.asks and len(pricebook.asks) > 0:
+                    best_ask = Decimal(str(pricebook.asks[0].price))
+                
+                # Calculate spread
+                spread = None
+                spread_pct = None
+                if best_bid and best_ask:
+                    spread = best_ask - best_bid
+                    spread_pct = (spread / best_bid) * 100
+                
+                result[product_id] = {
+                    'best_bid': best_bid,
+                    'best_ask': best_ask,
+                    'spread': spread,
+                    'spread_pct': float(spread_pct) if spread_pct else None
+                }
+            
+            logger.debug(f"Retrieved best bid/ask for {len(result)} products")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting best bid/ask: {e}")
+            return {}
+    
+    def place_limit_order_gtc(
+        self,
+        product_id: str,
+        side: str,
+        price: Decimal,
+        size: Decimal,
+        post_only: bool = True
+    ) -> Optional[Dict]:
+        """
+        Place a Good-Til-Cancelled limit order with optional post-only flag.
+        Post-only ensures maker order (earns rebates instead of paying taker fees).
+        
+        Args:
+            product_id: Product to trade
+            side: BUY or SELL
+            price: Limit price
+            size: Order size
+            post_only: If True, order will only execute as maker (earns rebates)
+            
+        Returns:
+            Order details if successful
+        """
+        try:
+            # Apply rate limiting before API call
+            self._rate_limit()
+            
+            response = self.rest_client.limit_order_gtc(
+                client_order_id=f"limit_gtc_{datetime.now(UTC).timestamp()}",
+                product_id=product_id,
+                side=side,
+                base_size=str(size),
+                limit_price=str(price),
+                post_only=post_only
+            )
+            
+            if not response:
+                logger.error(f"No response from limit order for {product_id}")
+                return None
+            
+            order = {
+                'order_id': getattr(response, 'order_id', None),
+                'product_id': product_id,
+                'side': side,
+                'type': 'limit_gtc',
+                'price': price,
+                'size': size,
+                'post_only': post_only,
+                'status': getattr(response, 'status', None)
+            }
+            
+            rebate_note = " (earning maker rebates)" if post_only else ""
+            logger.info(f"Limit order placed: {side} {size} {product_id} @ ${price}{rebate_note}")
+            
+            return order
+            
+        except Exception as e:
+            logger.error(f"Error placing limit order: {e}")
+            return None
+    
+    def get_fills(
+        self,
+        order_id: Optional[str] = None,
+        product_id: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        limit: int = 100
+    ) -> List[Dict]:
+        """
+        Get fill history for orders (actual execution details).
+        Critical for tracking real execution quality and slippage.
+        
+        Args:
+            order_id: Specific order ID to get fills for
+            product_id: Filter by product
+            start_date: Start date for fills
+            limit: Maximum number of fills to return
+            
+        Returns:
+            List of fill details with actual execution prices
+        """
+        try:
+            # Apply rate limiting before API call
+            self._rate_limit()
+            
+            # Build parameters
+            params = {}
+            if order_id:
+                params['order_ids'] = [order_id]
+            if product_id:
+                params['product_ids'] = [product_id]
+            if start_date:
+                params['start_sequence_timestamp'] = start_date.isoformat()
+            if limit:
+                params['limit'] = limit
+            
+            response = self.rest_client.get_fills(**params)
+            
+            if not response or not hasattr(response, 'fills'):
+                return []
+            
+            fills = []
+            for fill in response.fills:
+                fills.append({
+                    'entry_id': getattr(fill, 'entry_id', None),
+                    'trade_id': getattr(fill, 'trade_id', None),
+                    'order_id': getattr(fill, 'order_id', None),
+                    'trade_time': getattr(fill, 'trade_time', None),
+                    'trade_type': getattr(fill, 'trade_type', None),
+                    'price': Decimal(str(getattr(fill, 'price', 0))),
+                    'size': Decimal(str(getattr(fill, 'size', 0))),
+                    'commission': Decimal(str(getattr(fill, 'commission', 0))),
+                    'product_id': getattr(fill, 'product_id', None),
+                    'side': getattr(fill, 'side', None),
+                    'liquidity_indicator': getattr(fill, 'liquidity_indicator', None)  # MAKER or TAKER
+                })
+            
+            logger.info(f"Retrieved {len(fills)} fills")
+            return fills
+            
+        except Exception as e:
+            logger.error(f"Error getting fills: {e}")
+            return []
+    
+    def get_market_trades(
+        self,
+        product_id: str,
+        limit: int = 100
+    ) -> List[Dict]:
+        """
+        Get recent market trades for volume flow and liquidity analysis.
+        Shows buy vs sell pressure in real-time.
+        
+        Args:
+            product_id: Product to get trades for
+            limit: Number of recent trades to fetch
+            
+        Returns:
+            List of recent trades with side, price, size
+        """
+        try:
+            # Apply rate limiting before API call
+            self._rate_limit()
+            
+            response = self.rest_client.get_market_trades(
+                product_id=product_id,
+                limit=limit
+            )
+            
+            if not response or not hasattr(response, 'trades'):
+                return []
+            
+            trades = []
+            for trade in response.trades:
+                trades.append({
+                    'trade_id': getattr(trade, 'trade_id', None),
+                    'product_id': getattr(trade, 'product_id', None),
+                    'price': Decimal(str(getattr(trade, 'price', 0))),
+                    'size': Decimal(str(getattr(trade, 'size', 0))),
+                    'time': getattr(trade, 'time', None),
+                    'side': getattr(trade, 'side', None)  # BUY or SELL
+                })
+            
+            logger.debug(f"Retrieved {len(trades)} market trades for {product_id}")
+            return trades
+            
+        except Exception as e:
+            logger.error(f"Error getting market trades for {product_id}: {e}")
+            return []
+    
+    def analyze_volume_flow(
+        self,
+        product_id: str,
+        lookback_trades: int = 100
+    ) -> Dict:
+        """
+        Analyze buy vs sell volume flow to gauge market pressure.
+        
+        Args:
+            product_id: Product to analyze
+            lookback_trades: Number of recent trades to analyze
+            
+        Returns:
+            Dictionary with buy_pressure, sell_pressure, net_pressure
+        """
+        try:
+            trades = self.get_market_trades(product_id, limit=lookback_trades)
+            
+            if not trades:
+                return {
+                    'buy_volume': Decimal('0'),
+                    'sell_volume': Decimal('0'),
+                    'buy_pressure': 0.5,
+                    'net_pressure': 'neutral'
+                }
+            
+            buy_volume = sum(t['size'] for t in trades if t['side'] == 'BUY')
+            sell_volume = sum(t['size'] for t in trades if t['side'] == 'SELL')
+            total_volume = buy_volume + sell_volume
+            
+            buy_pressure = float(buy_volume / total_volume) if total_volume > 0 else 0.5
+            
+            # Classify pressure
+            if buy_pressure > 0.6:
+                net_pressure = 'strong_buy'
+            elif buy_pressure > 0.55:
+                net_pressure = 'moderate_buy'
+            elif buy_pressure < 0.4:
+                net_pressure = 'strong_sell'
+            elif buy_pressure < 0.45:
+                net_pressure = 'moderate_sell'
+            else:
+                net_pressure = 'neutral'
+            
+            result = {
+                'buy_volume': buy_volume,
+                'sell_volume': sell_volume,
+                'buy_pressure': buy_pressure,
+                'net_pressure': net_pressure
+            }
+            
+            logger.debug(f"{product_id} volume flow: {buy_pressure:.1%} buy pressure ({net_pressure})")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error analyzing volume flow: {e}")
+            return {
+                'buy_volume': Decimal('0'),
+                'sell_volume': Decimal('0'),
+                'buy_pressure': 0.5,
+                'net_pressure': 'neutral'
+            }
+    
     def close(self):
         """Close API connections."""
         if self.ws_client:
