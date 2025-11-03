@@ -8,8 +8,16 @@ from typing import Dict, Optional
 from decimal import Decimal
 import pandas as pd
 import logging
+import json
+from datetime import datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Create a separate logger for strategy signals
+signal_logger = logging.getLogger('strategy_signals')
+signal_logger.setLevel(logging.DEBUG)
+signal_logger.propagate = False  # Don't propagate to root logger
 
 
 class TradingSignal:
@@ -30,6 +38,14 @@ class TradingSignal:
     
     def __repr__(self):
         return f"TradingSignal(action={self.action}, confidence={self.confidence:.2f})"
+    
+    def to_dict(self) -> Dict:
+        """Convert signal to dictionary for logging"""
+        return {
+            'action': self.action,
+            'confidence': self.confidence,
+            'metadata': self.metadata
+        }
 
 
 class BaseStrategy(ABC):
@@ -44,6 +60,61 @@ class BaseStrategy(ABC):
         """
         self.config = config
         self.name = self.__class__.__name__
+        self.log_signals = False
+        self.signal_log_file = None
+    
+    def enable_signal_logging(self, log_file: str = None):
+        """
+        Enable detailed signal logging.
+        
+        Args:
+            log_file: Path to log file (default: logs/strategy_signals.log)
+        """
+        self.log_signals = True
+        
+        if log_file is None:
+            log_file = "logs/strategy_signals.log"
+        
+        self.signal_log_file = log_file
+        
+        # Ensure logs directory exists
+        Path(log_file).parent.mkdir(exist_ok=True)
+        
+        # Add file handler to signal_logger if not already present
+        if not signal_logger.handlers:
+            handler = logging.FileHandler(log_file)
+            handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            handler.setFormatter(formatter)
+            signal_logger.addHandler(handler)
+        
+        logger.info(f"Strategy signal logging enabled: {log_file}")
+    
+    def _log_signal(self, product_id: str, signal: TradingSignal, indicators: Dict = None):
+        """
+        Log strategy signal with full context.
+        
+        Args:
+            product_id: Product being analyzed
+            signal: Generated trading signal
+            indicators: Current indicator values
+        """
+        if not self.log_signals:
+            return
+        
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'strategy': self.name,
+            'product_id': product_id,
+            'signal': signal.to_dict(),
+            'indicators': indicators or {}
+        }
+        
+        # Log as formatted JSON
+        signal_logger.debug(json.dumps(log_entry, indent=2, default=str))
     
     @abstractmethod
     def analyze(self, df: pd.DataFrame, product_id: str) -> TradingSignal:

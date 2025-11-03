@@ -123,6 +123,12 @@ class TradingBot:
         api_key, api_secret = self.config.get_api_credentials()
         api = CoinbaseAPI(api_key, api_secret)
         
+        # Enable API response logging if configured
+        if self.config.get('logging.log_api_responses', False):
+            log_file = self.config.get('logging.api_log_file', 'logs/api_responses.log')
+            errors_only = self.config.get('logging.log_api_errors_only', False)
+            api.enable_api_logging(log_file=log_file, errors_only=errors_only)
+        
         # Check API permissions
         permissions = api.check_api_permissions()
         if permissions:

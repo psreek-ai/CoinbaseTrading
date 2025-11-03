@@ -169,3 +169,8 @@ logging:
   log_directory: "logs"
   max_log_size_mb: 100
   backup_count: 10
+  
+  # API Response Logging (for debugging)
+  log_api_responses: false  # Log raw API responses to separate file
+  api_log_file: "logs/api_responses.log"  # Separate file for API calls
+  log_api_errors_only: false  # If true, only log failed API calls

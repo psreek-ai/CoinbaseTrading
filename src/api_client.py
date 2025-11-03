@@ -9,12 +9,18 @@ from datetime import datetime, timedelta, UTC
 from decimal import Decimal
 from typing import Dict, List, Optional
 from threading import Thread, Lock
+from pathlib import Path
 
 import pandas as pd
 from coinbase.rest import RESTClient
 from coinbase.websocket import WSClient
 
 logger = logging.getLogger(__name__)
+
+# Create a separate logger for API responses
+api_response_logger = logging.getLogger('api_responses')
+api_response_logger.setLevel(logging.DEBUG)
+api_response_logger.propagate = False  # Don't propagate to root logger
 
 
 class CoinbaseAPI:
@@ -51,8 +57,101 @@ class CoinbaseAPI:
         self._last_request_time = 0
         self._min_request_interval = 0.2  # 200ms between requests (~5 req/sec max)
         
+        # API response logging configuration
+        self.log_api_responses = False
+        self.log_api_errors_only = False
+        
         # Initialize REST client
         self._initialize_rest_client()
+    
+    def enable_api_logging(self, log_file: str = None, errors_only: bool = False):
+        """
+        Enable detailed API response logging.
+        
+        Args:
+            log_file: Path to log file (default: logs/api_responses.log)
+            errors_only: If True, only log failed API calls
+        """
+        self.log_api_responses = True
+        self.log_api_errors_only = errors_only
+        
+        if log_file is None:
+            log_file = "logs/api_responses.log"
+        
+        # Ensure logs directory exists
+        Path(log_file).parent.mkdir(exist_ok=True)
+        
+        # Add file handler to api_response_logger if not already present
+        if not api_response_logger.handlers:
+            handler = logging.FileHandler(log_file)
+            handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            handler.setFormatter(formatter)
+            api_response_logger.addHandler(handler)
+        
+        logger.info(f"API response logging enabled: {log_file} (errors_only={errors_only})")
+    
+    def _log_api_call(self, method: str, endpoint: str, params: Dict = None, 
+                     response: any = None, error: Exception = None):
+        """
+        Log API call details for debugging.
+        
+        Args:
+            method: HTTP method or SDK method name
+            endpoint: API endpoint or description
+            params: Request parameters
+            response: API response object
+            error: Exception if call failed
+        """
+        if not self.log_api_responses:
+            return
+        
+        # Skip logging if errors_only is True and there's no error
+        if self.log_api_errors_only and error is None:
+            return
+        
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'method': method,
+            'endpoint': endpoint,
+            'params': params or {},
+        }
+        
+        if error:
+            log_entry['status'] = 'ERROR'
+            log_entry['error'] = str(error)
+            log_entry['error_type'] = type(error).__name__
+        else:
+            log_entry['status'] = 'SUCCESS'
+            
+            # Try to serialize response
+            try:
+                if response is None:
+                    log_entry['response'] = None
+                elif isinstance(response, (str, int, float, bool)):
+                    log_entry['response'] = response
+                elif isinstance(response, (dict, list)):
+                    log_entry['response'] = response
+                elif isinstance(response, pd.DataFrame):
+                    log_entry['response'] = f"DataFrame({len(response)} rows, {len(response.columns)} cols)"
+                    log_entry['response_preview'] = response.head(3).to_dict() if not response.empty else {}
+                elif hasattr(response, '__dict__'):
+                    # SDK response object - try to extract relevant data
+                    log_entry['response_type'] = type(response).__name__
+                    log_entry['response_attributes'] = {
+                        k: str(v)[:200] for k, v in response.__dict__.items() 
+                        if not k.startswith('_')
+                    }
+                else:
+                    log_entry['response'] = str(response)[:500]
+            except Exception as e:
+                log_entry['response'] = f"<Unable to serialize: {e}>"
+        
+        # Log as formatted JSON
+        api_response_logger.debug(json.dumps(log_entry, indent=2, default=str))
     
     def _initialize_rest_client(self):
         """Initialize REST API client."""
@@ -350,6 +449,15 @@ class CoinbaseAPI:
         """Get the default portfolio ID."""
         try:
             response = self.rest_client.get_portfolios()
+            
+            # Log API call
+            self._log_api_call(
+                method='get_portfolios',
+                endpoint='/portfolios',
+                params={},
+                response=response
+            )
+            
             if response.portfolios and len(response.portfolios) > 0:
                 portfolio_id = response.portfolios[0].uuid
                 logger.info(f"Retrieved portfolio ID: {portfolio_id}")
@@ -359,6 +467,15 @@ class CoinbaseAPI:
                 return None
         except Exception as e:
             logger.error(f"Error getting portfolio ID: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_portfolios',
+                endpoint='/portfolios',
+                params={},
+                error=e
+            )
+            
             return None
     
     def get_all_portfolios(self) -> List[Dict]:
@@ -370,6 +487,14 @@ class CoinbaseAPI:
         """
         try:
             response = self.rest_client.get_portfolios()
+            
+            # Log API call
+            self._log_api_call(
+                method='get_portfolios',
+                endpoint='/portfolios',
+                params={},
+                response=response
+            )
             
             portfolios = []
             if response.portfolios:
@@ -386,6 +511,15 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error getting portfolios: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_portfolios',
+                endpoint='/portfolios',
+                params={},
+                error=e
+            )
+            
             return []
     
     def create_portfolio(self, name: str) -> Optional[str]:
@@ -401,6 +535,14 @@ class CoinbaseAPI:
         try:
             response = self.rest_client.create_portfolio(name=name)
             
+            # Log API call
+            self._log_api_call(
+                method='create_portfolio',
+                endpoint='/portfolios',
+                params={'name': name},
+                response=response
+            )
+            
             if response and hasattr(response, 'portfolio'):
                 portfolio_id = response.portfolio.uuid
                 logger.info(f"Created portfolio: {name} ({portfolio_id})")
@@ -411,6 +553,15 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error creating portfolio: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='create_portfolio',
+                endpoint='/portfolios',
+                params={'name': name},
+                error=e
+            )
+            
             return None
     
     def get_account_balances(
@@ -436,6 +587,14 @@ class CoinbaseAPI:
                 portfolio_uuid=portfolio_id
             )
             
+            # Log API response
+            self._log_api_call(
+                method='get_portfolio_breakdown',
+                endpoint=f'/portfolios/{portfolio_id}/breakdown',
+                params={'portfolio_uuid': portfolio_id},
+                response=breakdown
+            )
+            
             balances = {}
             
             if breakdown and breakdown.breakdown and breakdown.breakdown.spot_positions:
@@ -455,6 +614,12 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error getting balances: {e}")
+            self._log_api_call(
+                method='get_portfolio_breakdown',
+                endpoint=f'/portfolios/{portfolio_id}/breakdown',
+                params={'portfolio_uuid': portfolio_id},
+                error=e
+            )
             return {}
     
     def find_tradable_products(
@@ -478,6 +643,15 @@ class CoinbaseAPI:
             self._rate_limit()
             
             response = self.rest_client.get_products()
+            
+            # Log API call
+            self._log_api_call(
+                method='get_products',
+                endpoint='/products',
+                params={},
+                response=response
+            )
+            
             all_products = response.products
             
             for product in all_products:
@@ -493,6 +667,15 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error finding tradable products: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_products',
+                endpoint='/products',
+                params={},
+                error=e
+            )
+            
             return []
     
     def get_product_details(self, product_ids: List[str]) -> Dict[str, Dict]:
@@ -513,6 +696,14 @@ class CoinbaseAPI:
                 self._rate_limit()
                 
                 product_info = self.rest_client.get_product(product_id=product_id)
+                
+                # Log API call
+                self._log_api_call(
+                    method='get_product',
+                    endpoint=f'/products/{product_id}',
+                    params={'product_id': product_id},
+                    response=product_info
+                )
                 
                 # Extract minimum sizes with fallbacks
                 base_min_size = Decimal('0')
@@ -537,6 +728,15 @@ class CoinbaseAPI:
                 
             except Exception as e:
                 logger.error(f"Error getting details for {product_id}: {e}")
+                
+                # Log API error
+                self._log_api_call(
+                    method='get_product',
+                    endpoint=f'/products/{product_id}',
+                    params={'product_id': product_id},
+                    error=e
+                )
+                
                 details[product_id] = {
                     'base_min_size': Decimal('0'),
                     'min_market_funds': Decimal('0')
@@ -594,6 +794,20 @@ class CoinbaseAPI:
                 granularity=granularity
             )
             
+            # Log API response
+            self._log_api_call(
+                method='get_candles',
+                endpoint=f'/products/{product_id}/candles',
+                params={
+                    'product_id': product_id,
+                    'start': start_time.isoformat(),
+                    'end': end_time.isoformat(),
+                    'granularity': granularity,
+                    'requested_periods': periods
+                },
+                response=candles_data
+            )
+            
             if not hasattr(candles_data, 'candles') or not candles_data.candles:
                 logger.warning(f"No candle data for {product_id}")
                 return pd.DataFrame()
@@ -625,6 +839,16 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error fetching historical data for {product_id}: {e}")
+            self._log_api_call(
+                method='get_candles',
+                endpoint=f'/products/{product_id}/candles',
+                params={
+                    'product_id': product_id,
+                    'granularity': granularity,
+                    'periods': periods
+                },
+                error=e
+            )
             return pd.DataFrame()
     
     def get_latest_price(self, product_id: str) -> Optional[Decimal]:
@@ -647,11 +871,28 @@ class CoinbaseAPI:
             self._rate_limit()
             
             product = self.rest_client.get_product(product_id=product_id)
+            
+            # Log API call
+            self._log_api_call(
+                method='get_product',
+                endpoint=f'/products/{product_id}',
+                params={'product_id': product_id},
+                response=product
+            )
+            
             price = getattr(product, 'price', None)
             if price:
                 return Decimal(str(price))
         except Exception as e:
             logger.error(f"Error getting price for {product_id}: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_product',
+                endpoint=f'/products/{product_id}',
+                params={'product_id': product_id},
+                error=e
+            )
         
         return None
     
@@ -680,6 +921,18 @@ class CoinbaseAPI:
                 base_size=str(size) if side == "SELL" else None
             )
             
+            # Log API call
+            self._log_api_call(
+                method='preview_market_order',
+                endpoint='/orders/preview',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'size': str(size)
+                },
+                response=response
+            )
+            
             if not response:
                 logger.warning(f"No preview response for {side} {product_id}")
                 return None
@@ -706,6 +959,19 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error previewing order: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='preview_market_order',
+                endpoint='/orders/preview',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'size': str(size)
+                },
+                error=e
+            )
+            
             return None
     
     def get_transaction_summary(
@@ -738,6 +1004,18 @@ class CoinbaseAPI:
                 end_date=end_date.isoformat()
             )
             
+            # Log API call
+            self._log_api_call(
+                method='get_transaction_summary',
+                endpoint='/transaction_summary',
+                params={
+                    'account_uuid': portfolio_id,
+                    'start_date': start_date.isoformat(),
+                    'end_date': end_date.isoformat()
+                },
+                response=response
+            )
+            
             if not response:
                 return None
             
@@ -760,6 +1038,19 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error getting transaction summary: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_transaction_summary',
+                endpoint='/transaction_summary',
+                params={
+                    'account_uuid': portfolio_id,
+                    'start_date': start_date.isoformat() if start_date else None,
+                    'end_date': end_date.isoformat() if end_date else None
+                },
+                error=e
+            )
+            
             return None
     
     def check_api_permissions(self) -> Dict[str, bool]:
@@ -771,6 +1062,14 @@ class CoinbaseAPI:
         """
         try:
             response = self.rest_client.get_api_key_permissions()
+            
+            # Log API call
+            self._log_api_call(
+                method='get_api_key_permissions',
+                endpoint='/key_permissions',
+                params={},
+                response=response
+            )
             
             if not response:
                 logger.warning("No permissions response received")
@@ -792,6 +1091,15 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error checking API permissions: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_api_key_permissions',
+                endpoint='/key_permissions',
+                params={},
+                error=e
+            )
+            
             return {}
     
     def create_stop_limit_order(
@@ -826,6 +1134,20 @@ class CoinbaseAPI:
                 stop_direction="STOP_DIRECTION_STOP_DOWN" if side == "SELL" else "STOP_DIRECTION_STOP_UP"
             )
             
+            # Log API call
+            self._log_api_call(
+                method='stop_limit_order_gtc',
+                endpoint='/orders',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'base_size': str(base_size),
+                    'limit_price': str(limit_price),
+                    'stop_price': str(stop_price)
+                },
+                response=response
+            )
+            
             if not response:
                 logger.error(f"No response from stop-limit order for {product_id}")
                 return None
@@ -848,6 +1170,21 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error creating stop-limit order: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='stop_limit_order_gtc',
+                endpoint='/orders',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'base_size': str(base_size),
+                    'limit_price': str(limit_price),
+                    'stop_price': str(stop_price)
+                },
+                error=e
+            )
+            
             return None
     
     def create_bracket_order(
@@ -884,6 +1221,21 @@ class CoinbaseAPI:
                 take_profit_limit_price=str(take_profit_price)
             )
             
+            # Log API call
+            self._log_api_call(
+                method='trigger_bracket_order_gtc',
+                endpoint='/orders',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'base_size': str(base_size),
+                    'limit_price': str(limit_price),
+                    'stop_loss_price': str(stop_loss_price),
+                    'take_profit_price': str(take_profit_price)
+                },
+                response=response
+            )
+            
             if not response:
                 logger.error(f"No response from bracket order for {product_id}")
                 return None
@@ -907,6 +1259,22 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error creating bracket order: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='trigger_bracket_order_gtc',
+                endpoint='/orders',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'base_size': str(base_size),
+                    'limit_price': str(limit_price),
+                    'stop_loss_price': str(stop_loss_price),
+                    'take_profit_price': str(take_profit_price)
+                },
+                error=e
+            )
+            
             return None
     
     def cancel_order(self, order_id: str) -> bool:
@@ -922,6 +1290,14 @@ class CoinbaseAPI:
         try:
             response = self.rest_client.cancel_orders(order_ids=[order_id])
             
+            # Log API call
+            self._log_api_call(
+                method='cancel_orders',
+                endpoint='/orders/batch_cancel',
+                params={'order_ids': [order_id]},
+                response=response
+            )
+            
             if response and hasattr(response, 'results'):
                 for result in response.results:
                     if result.success:
@@ -933,6 +1309,15 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error cancelling order {order_id}: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='cancel_orders',
+                endpoint='/orders/batch_cancel',
+                params={'order_ids': [order_id]},
+                error=e
+            )
+            
             return False
     
     def get_order_status(self, order_id: str) -> Optional[Dict]:
@@ -947,6 +1332,14 @@ class CoinbaseAPI:
         """
         try:
             response = self.rest_client.get_order(order_id=order_id)
+            
+            # Log API call
+            self._log_api_call(
+                method='get_order',
+                endpoint=f'/orders/historical/{order_id}',
+                params={'order_id': order_id},
+                response=response
+            )
             
             if not response:
                 return None
@@ -965,6 +1358,15 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error getting order status for {order_id}: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_order',
+                endpoint=f'/orders/historical/{order_id}',
+                params={'order_id': order_id},
+                error=e
+            )
+            
             return None
     
     def get_best_bid_ask(self, product_ids: List[str]) -> Dict:
@@ -983,6 +1385,14 @@ class CoinbaseAPI:
             self._rate_limit()
             
             response = self.rest_client.get_best_bid_ask(product_ids=product_ids)
+            
+            # Log API call
+            self._log_api_call(
+                method='get_best_bid_ask',
+                endpoint='/best_bid_ask',
+                params={'product_ids': product_ids},
+                response=response
+            )
             
             if not response or not hasattr(response, 'pricebooks'):
                 logger.warning("No pricebooks in best bid/ask response")
@@ -1021,6 +1431,15 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error getting best bid/ask: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_best_bid_ask',
+                endpoint='/best_bid_ask',
+                params={'product_ids': product_ids},
+                error=e
+            )
+            
             return {}
     
     def place_limit_order_gtc(
@@ -1058,6 +1477,20 @@ class CoinbaseAPI:
                 post_only=post_only
             )
             
+            # Log API response
+            self._log_api_call(
+                method='limit_order_gtc',
+                endpoint='/orders',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'price': str(price),
+                    'size': str(size),
+                    'post_only': post_only
+                },
+                response=response
+            )
+            
             if not response:
                 logger.error(f"No response from limit order for {product_id}")
                 return None
@@ -1080,6 +1513,17 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error placing limit order: {e}")
+            self._log_api_call(
+                method='limit_order_gtc',
+                endpoint='/orders',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'price': str(price),
+                    'size': str(size)
+                },
+                error=e
+            )
             return None
     
     def get_fills(
@@ -1119,6 +1563,14 @@ class CoinbaseAPI:
             
             response = self.rest_client.get_fills(**params)
             
+            # Log API call
+            self._log_api_call(
+                method='get_fills',
+                endpoint='/orders/historical/fills',
+                params=params,
+                response=response
+            )
+            
             if not response or not hasattr(response, 'fills'):
                 return []
             
@@ -1143,6 +1595,19 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error getting fills: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_fills',
+                endpoint='/orders/historical/fills',
+                params={
+                    'order_id': order_id,
+                    'product_id': product_id,
+                    'limit': limit
+                },
+                error=e
+            )
+            
             return []
     
     def get_market_trades(
@@ -1170,6 +1635,14 @@ class CoinbaseAPI:
                 limit=limit
             )
             
+            # Log API call
+            self._log_api_call(
+                method='get_market_trades',
+                endpoint=f'/products/{product_id}/ticker',
+                params={'product_id': product_id, 'limit': limit},
+                response=response
+            )
+            
             if not response or not hasattr(response, 'trades'):
                 return []
             
@@ -1189,6 +1662,15 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error getting market trades for {product_id}: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='get_market_trades',
+                endpoint=f'/products/{product_id}/ticker',
+                params={'product_id': product_id, 'limit': limit},
+                error=e
+            )
+            
             return []
     
     def analyze_volume_flow(
