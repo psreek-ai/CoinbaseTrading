@@ -1,5 +1,6 @@
 
 import logging
+import uuid
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 from typing import Dict
@@ -216,7 +217,10 @@ class TradeExecutor:
 
         if self.paper_trading:
             # Paper trading: Simulate limit order with post-only
-            order_id = f"PAPER_LIMIT_{datetime.now().strftime('%Y%m%d%H%M%S')}_{product_id}"
+            # Use microseconds and UUID to ensure uniqueness
+            timestamp = datetime.now().strftime('%Y%m%d%H%M%S%f')  # Include microseconds
+            unique_id = str(uuid.uuid4())[:8]  # Short UUID for extra uniqueness
+            order_id = f"PAPER_LIMIT_{timestamp}_{unique_id}_{product_id}"
 
             # Save to database with preview data
             self.db.insert_order({

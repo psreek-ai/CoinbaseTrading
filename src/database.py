@@ -199,27 +199,43 @@ class DatabaseManager:
             # Convert Decimal to string and handle metadata
             processed_data = self._process_order_data(order_data)
             
-            cursor.execute("""
-                INSERT INTO orders (
-                    client_order_id, product_id, side, order_type, status,
-                    base_size, quote_size, entry_price, stop_loss, take_profit, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                processed_data['client_order_id'],
-                processed_data['product_id'],
-                processed_data['side'],
-                processed_data['order_type'],
-                processed_data['status'],
-                self._decimal_to_str(processed_data.get('base_size')),
-                self._decimal_to_str(processed_data.get('quote_size')),
-                self._decimal_to_str(processed_data.get('entry_price')),
-                self._decimal_to_str(processed_data.get('stop_loss')),
-                self._decimal_to_str(processed_data.get('take_profit')),
-                json.dumps(processed_data.get('metadata', {}))
-            ))
-            
-            self.conn.commit()
-            return cursor.lastrowid
+            try:
+                cursor.execute("""
+                    INSERT INTO orders (
+                        client_order_id, product_id, side, order_type, status,
+                        base_size, quote_size, entry_price, stop_loss, take_profit, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    processed_data['client_order_id'],
+                    processed_data['product_id'],
+                    processed_data['side'],
+                    processed_data['order_type'],
+                    processed_data['status'],
+                    self._decimal_to_str(processed_data.get('base_size')),
+                    self._decimal_to_str(processed_data.get('quote_size')),
+                    self._decimal_to_str(processed_data.get('entry_price')),
+                    self._decimal_to_str(processed_data.get('stop_loss')),
+                    self._decimal_to_str(processed_data.get('take_profit')),
+                    json.dumps(processed_data.get('metadata', {}))
+                ))
+                
+                self.conn.commit()
+                return cursor.lastrowid
+            except sqlite3.IntegrityError as e:
+                if "UNIQUE constraint failed: orders.client_order_id" in str(e):
+                    # Log the duplicate and check if it's the same order
+                    logger = logging.getLogger(__name__)
+                    logger.error(f"Duplicate client_order_id: {processed_data['client_order_id']}")
+                    
+                    # Check if this exact order already exists
+                    cursor.execute("SELECT id FROM orders WHERE client_order_id = ?", 
+                                 (processed_data['client_order_id'],))
+                    existing = cursor.fetchone()
+                    if existing:
+                        logger.warning(f"Order already exists in database with id {existing[0]}, skipping insert")
+                        return existing[0]
+                # Re-raise if it's a different integrity error or we couldn't handle it
+                raise
     
     def update_order_status(self, client_order_id: str, status: str, 
                           filled_price: float = None, filled_size: float = None,

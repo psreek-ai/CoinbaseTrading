@@ -76,6 +76,10 @@ class CoinbaseAPI:
         self.log_api_responses = False
         self.log_api_errors_only = False
         
+        # Shutdown event for graceful WebSocket termination
+        from threading import Event
+        self._shutdown_event = Event()
+        
         # Initialize REST client
         self._initialize_rest_client()
     
@@ -2397,7 +2401,10 @@ class CoinbaseAPI:
             }
     
     def close(self):
-        """Close API connections."""
+        """Close API connections and signal WebSocket thread to shutdown."""
+        # Signal WebSocket reconnection loop to stop
+        self._shutdown_event.set()
+        
         if self.ws_client:
             try:
                 self.ws_client.close()
