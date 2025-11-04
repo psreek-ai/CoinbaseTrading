@@ -65,6 +65,7 @@ class TradeExecutor:
         bid_ask = self.api.get_best_bid_ask([product_id])
 
         if bid_ask and product_id in bid_ask:
+            best_bid = bid_ask[product_id]['best_bid']
             best_ask = bid_ask[product_id]['best_ask']
             spread = bid_ask[product_id]['spread']
             spread_pct = bid_ask[product_id]['spread_pct']
@@ -79,11 +80,12 @@ class TradeExecutor:
             product_info = product_details.get(product_id, {})
             price_increment = Decimal(str(product_info.get('price_increment', '0.01')))
             
-            # Place limit order AT best ask to ensure fill (still uses post-only for maker rebate if possible)
-            # If we want to be more aggressive, we could do: best_ask + price_increment
-            entry_price = best_ask
+            # For post-only BUY orders, price must be <= best_bid to avoid immediate match
+            # Place at best_bid to sit in order book (maker) instead of crossing spread (taker)
+            # This gives us maker rebate instead of paying taker fee
+            entry_price = best_bid
 
-            logger.info(f"Spread analysis: Best Ask=${best_ask}, Spread={spread_pct:.3f}%, Entry=${entry_price}")
+            logger.info(f"Spread analysis: Best Bid=${best_bid}, Best Ask=${best_ask}, Spread={spread_pct:.3f}%, Entry=${entry_price} (post-only at bid)")
         else:
             # Fallback to latest price if bid/ask not available
             entry_price = self.api.get_latest_price(product_id)

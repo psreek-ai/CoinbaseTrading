@@ -912,7 +912,7 @@ class TradingBot:
                     time.sleep(loop_sleep)
                     continue
                 
-                # Get open positions and check stop loss/take profit
+                # Get open positions and check for signal-confirmed profit/loss targets
                 open_positions = self.db.get_open_positions()
                 logger.info(f"Open Positions: {len(open_positions)}")
                 
@@ -924,30 +924,91 @@ class TradingBot:
                         # Update position price in DB for PnL tracking (all modes)
                         self.db.update_position(product_id, current_price=float(current_price))
                         
-                        # --- REFACTORED EXIT LOGIC ---
-                        # Paper trading MUST poll for SL/TP as it has no real exchange orders
-                        if self.paper_trading:
-                            # Check if should close based on polling
-                            should_close, reason = self.risk_manager.should_close_position(
-                                position, current_price
-                            )
+                        # --- SIGNAL-CONFIRMED PROFIT/LOSS EXIT STRATEGY ---
+                        # Calculate cost basis from all BUY fills (includes fees)
+                        cost_basis = self.api.calculate_cost_basis(product_id)
+                        
+                        if cost_basis:
+                            # Calculate profit/loss percentage
+                            profit_pct = ((current_price - cost_basis) / cost_basis) * 100
                             
-                            if should_close:
-                                logger.info(f"[PAPER] Closing position {product_id}: {reason}")
-                                self.execute_sell_order(product_id, position, reason)
+                            # Get current signal for this position
+                            try:
+                                granularity = self.config.get('trading.candle_granularity', 'FIFTEEN_MINUTE')
+                                periods = self.config.get('trading.candle_periods_for_analysis', 200)
+                                df = self.api.get_historical_data(product_id, granularity, periods)
+                                
+                                if not df.empty and len(df) >= 50:
+                                    signal = self.strategy.analyze(df, product_id)
+                                    current_signal = signal.action
+                                    signal_confidence = signal.confidence
+                                    
+                                    logger.info(f"{product_id}: Current=${current_price:.6f}, "
+                                               f"Cost Basis=${cost_basis:.6f}, "
+                                               f"Profit={profit_pct:.2f}%, "
+                                               f"Signal={current_signal} ({signal_confidence:.1%})")
+                                    
+                                    # PROFIT EXIT: +5% with HOLD or SELL signal (NOT BUY)
+                                    if profit_pct >= 5.0 and current_signal in ['HOLD', 'SELL']:
+                                        reason = f"5% PROFIT + {current_signal} SIGNAL ({profit_pct:.2f}%, conf={signal_confidence:.1%})"
+                                        logger.info(f"[PROFIT EXIT] {product_id}: {reason}")
+                                        self.execute_sell_order(product_id, position, reason)
+                                        continue
+                                    
+                                    # PROFIT TARGET REACHED BUT BUY SIGNAL - STAY IN POSITION
+                                    elif profit_pct >= 5.0 and current_signal == 'BUY':
+                                        logger.info(f"[HOLD] {product_id}: 5% profit reached but BUY signal active - staying in position")
+                                    
+                                    # LOSS EXIT: -2% with strong SELL signal
+                                    elif profit_pct <= -2.0 and current_signal == 'SELL' and signal_confidence >= 0.6:
+                                        reason = f"2% LOSS + STRONG SELL SIGNAL ({profit_pct:.2f}%, conf={signal_confidence:.1%})"
+                                        logger.warning(f"[LOSS EXIT] {product_id}: {reason}")
+                                        self.execute_sell_order(product_id, position, reason)
+                                        continue
+                                    
+                                    # LOSS WARNING BUT NOT SELLING
+                                    elif profit_pct <= -2.0:
+                                        logger.warning(f"[LOSS WARNING] {product_id}: {profit_pct:.2f}% loss but {current_signal} signal - holding")
+                                    
+                                else:
+                                    logger.warning(f"{product_id}: Insufficient data for signal analysis")
+                                    
+                            except Exception as e:
+                                logger.error(f"{product_id}: Error getting current signal: {e}")
                             
-                            # Update trailing stop if enabled
-                            elif self.risk_manager.use_trailing_stop:
-                                new_stop = self.risk_manager.update_trailing_stop(
+                            # Optional: Paper trading fallback for stop-loss
+                            if self.paper_trading:
+                                should_close, reason = self.risk_manager.should_close_position(
                                     position, current_price
                                 )
-                                if new_stop:
-                                    self.db.update_position(product_id, stop_loss=float(new_stop))
+                                
+                                if should_close:
+                                    logger.info(f"[PAPER] Closing position {product_id}: {reason}")
+                                    self.execute_sell_order(product_id, position, reason)
+                                
+                                # Update trailing stop if enabled
+                                elif self.risk_manager.use_trailing_stop:
+                                    new_stop = self.risk_manager.update_trailing_stop(
+                                        position, current_price
+                                    )
+                                    if new_stop:
+                                        self.db.update_position(product_id, stop_loss=float(new_stop))
+                        else:
+                            logger.warning(f"{product_id}: Could not calculate cost basis, "
+                                         f"falling back to entry_price from DB")
+                            # Fallback to old logic if cost basis calculation fails
+                            if self.paper_trading:
+                                should_close, reason = self.risk_manager.should_close_position(
+                                    position, current_price
+                                )
+                                
+                                if should_close:
+                                    logger.info(f"[PAPER] Closing position {product_id}: {reason}")
+                                    self.execute_sell_order(product_id, position, reason)
                         
-                        # In live mode, SL/TP exits are handled by _check_open_orders()
-                        # which reacts to FILLED events from exchange's native orders.
-                        # This eliminates the race condition between bot polling and exchange execution.
-                        # --- END REFACTORED EXIT LOGIC ---
+                        # In live mode, signal-confirmed exits are handled here
+                        # SL/TP exits are handled by _check_open_orders() for exchange orders
+                        # --- END SIGNAL-CONFIRMED PROFIT/LOSS EXIT STRATEGY ---
                 
                 # Run full market scan every cycle
                 logger.info("=" * 80)

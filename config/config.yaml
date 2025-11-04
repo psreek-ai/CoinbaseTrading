@@ -67,7 +67,7 @@ risk_management:
   max_slippage_percent: 0.01  # 1%
   
   # Order fill timeout (seconds to wait for limit order to fill before cancelling)
-  order_fill_timeout: 300  # 5 minutes (was 30s - increased for better fill rates)
+  order_fill_timeout: 60  # 60 seconds
 
 # Strategy Selection and Parameters
 strategies:

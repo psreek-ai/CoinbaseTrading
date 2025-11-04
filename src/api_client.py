@@ -2032,6 +2032,15 @@ class CoinbaseAPI:
                     order_id = response.success_response.get('order_id')
             elif hasattr(response, 'order_id'):
                 order_id = response.order_id
+            elif isinstance(response, dict):
+                order_id = response.get('order_id')
+            
+            # If still no order_id, log the response structure for debugging
+            if not order_id:
+                logger.error(f"Could not extract order_id from response. Response type: {type(response)}")
+                logger.error(f"Response attributes: {dir(response)}")
+                if hasattr(response, '__dict__'):
+                    logger.error(f"Response dict: {response.__dict__}")
             
             order = {
                 'order_id': order_id,
@@ -2150,6 +2159,79 @@ class CoinbaseAPI:
             )
             
             raise APIError(f"Failed to get fills: {e}") from e
+    
+    def calculate_cost_basis(self, product_id: str) -> Optional[Decimal]:
+        """
+        Calculate the average cost basis for a product based on all BUY fills.
+        Includes commission fees in the cost calculation for accurate profitability tracking.
+        
+        This is critical for profit-based exit strategies - you need to know the true
+        cost (including fees) to determine when you've reached a profit target.
+        
+        Formula: total_cost = sum((price × size) + commission) / sum(size)
+        
+        Args:
+            product_id: The product to calculate cost basis for (e.g., 'XCN-USDC')
+            
+        Returns:
+            Average cost per unit including fees, or None if no BUY fills found
+            
+        Example:
+            If you bought XCN in 3 separate orders:
+            - Order 1: 1000 XCN @ $0.007, commission $0.05
+            - Order 2: 500 XCN @ $0.008, commission $0.03
+            - Order 3: 1500 XCN @ $0.0069, commission $0.07
+            
+            total_cost = (1000*0.007 + 0.05) + (500*0.008 + 0.03) + (1500*0.0069 + 0.07)
+                       = 7.05 + 4.03 + 10.42 = $21.50
+            total_size = 1000 + 500 + 1500 = 3000
+            cost_basis = 21.50 / 3000 = $0.00717 per XCN
+        """
+        try:
+            # Get all fills for this product (not filtered by order_id, to get ALL fills)
+            # We'll fetch more than default to get complete history
+            all_fills = self.get_fills(product_id=product_id, limit=1000)
+            
+            if not all_fills:
+                logger.warning(f"No fills found for {product_id}")
+                return None
+            
+            # Filter to only BUY fills (we don't want SELL fills in cost basis)
+            buy_fills = [f for f in all_fills if f['side'] == 'BUY']
+            
+            if not buy_fills:
+                logger.warning(f"No BUY fills found for {product_id}")
+                return None
+            
+            # Calculate total cost and total size
+            total_cost = Decimal('0')
+            total_size = Decimal('0')
+            
+            for fill in buy_fills:
+                price = fill['price']
+                size = fill['size']
+                commission = fill['commission']
+                
+                # Cost for this fill = (price per unit × quantity) + fees
+                fill_cost = (price * size) + commission
+                total_cost += fill_cost
+                total_size += size
+            
+            if total_size == 0:
+                logger.warning(f"Total size is 0 for {product_id}")
+                return None
+            
+            # Average cost basis per unit
+            cost_basis = total_cost / total_size
+            
+            logger.info(f"Cost basis for {product_id}: ${cost_basis:.6f} "
+                       f"(from {len(buy_fills)} BUY fills, total size: {total_size})")
+            
+            return cost_basis
+            
+        except Exception as e:
+            logger.error(f"Error calculating cost basis for {product_id}: {e}")
+            return None
     
     def get_market_trades(
         self,
