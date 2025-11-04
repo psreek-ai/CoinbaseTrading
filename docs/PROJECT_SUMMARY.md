@@ -23,6 +23,8 @@ I've completely transformed your basic trading bot into a **production-grade, en
 - ✅ **Modular Architecture** (12+ specialized modules)
 - ✅ **YAML Configuration** (no code changes needed)
 - ✅ **Comprehensive Documentation** (4 detailed guides)
+- ✅ **Signal-Confirmed Exit Engine** (5% profit / -2% loss gated by live signals)
+- ✅ **Unified Logging** (synchronized trading/API/WebSocket logs with real-time callbacks)
 
 ## 🏗️ Project Structure
 
@@ -102,6 +104,7 @@ CoinbaseTrading/
 - **Automatic SL/TP:** Every position has protection
 - **Trailing Stops:** Optional trailing stop loss
 - **Risk/Reward Ratios:** Configurable (default 1.5% SL, 3% TP)
+- **Signal-Confirmed Exits:** 5% profit / -2% loss logic consults live BUY/HOLD/SELL signals
 
 ### 3. Performance Analytics
 
@@ -176,6 +179,7 @@ CoinbaseTrading/
 - Timestamped log files
 - Detailed stack traces
 - Performance tracking
+- Unified timestamps for trading/API/WebSocket logs + dedicated WebSocket message capture
 
 ## 📚 Documentation
 

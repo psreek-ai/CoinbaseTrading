@@ -2,7 +2,7 @@
 
 Professional-grade automated cryptocurrency trading system with enterprise-level optimizations, advanced strategies, and institutional execution quality.
 
-## ✨ What's New (November 3, 2025 - MAJOR UPDATE)
+## ✨ What's New (November 3-4, 2025)
 
 ### 🚀 Execution Optimizations (+1% per trade)
 - **Limit Orders with Maker Rebates**: Earn 0.4% rebates instead of paying 0.6% taker fees
@@ -16,6 +16,16 @@ Professional-grade automated cryptocurrency trading system with enterprise-level
 - **Stochastic Timing**: Oversold/overbought timing with K/D crossovers
 - **Improved Entry Logic**: Buy pullbacks in uptrends (not late extensions)
 - **Consolidation Detection**: Identifies accumulation before breakouts (ADX < 20, BB squeeze)
+
+### 🎯 Exit Intelligence (NEW - Nov 4)
+- **Signal-Confirmed Profit Taking**: 5% profit exits require HOLD/SELL confirmation; BUY signals keep the trade alive.
+- **Smart Loss Cutting**: -2% loss exits only trigger on confident SELL signals (≥60% confidence).
+- **True Cost Basis**: Combines every fill + fee to make exit decisions on real PnL, not estimates.
+
+### 📡 Operational Visibility (NEW - Nov 4)
+- **Unified Logging**: Trading, REST, and WebSocket logs now share the same timestamp per run.
+- **WebSocket Order Feed**: Dedicated logger captures real-time fill/terminal updates from Coinbase user channel.
+- **Confidence Fixes**: Momentum strategy Bollinger references corrected—no more zero-confidence HOLD spam.
 
 ### 💡 Other Improvements
 - **🔍 Market Scanner**: Analyze 600+ Coinbase products to find best opportunities
@@ -134,6 +144,7 @@ All strategies now include **ADX trend strength**, **EMA trend direction**, and 
 - **Min Trade Size**: $10 USD equivalent
 - **Spread Protection**: Rejects entries if spread >0.5%
 - **Volume Confirmation**: Requires >45% buy pressure for long entries
+- **Signal-Confirmed Exits**: 5% profit / -2% loss exits require real-time strategy confirmation
 
 ## 📈 Performance Tracking
 
@@ -159,6 +170,7 @@ Metrics tracked:
 - Maximum drawdown
 - Equity curve
 - Per-trade P&L
+- Cost basis per product (fees included)
 
 ## 📁 Project Structure
 

@@ -258,6 +258,18 @@ tail -f logs/trading_bot_*.log
 
 ---
 
+### Understand the Exit Strategy
+
+While the bot runs you'll see new log lines such as `[PROFIT EXIT]` or `[LOSS EXIT]`. These come from the signal-confirmed exit module:
+
+- **Profit exits** only fire after the position is up **5%** *and* the active strategy reports a HOLD or SELL signal.
+- **Loss exits** trigger when the position is down **2%** *and* the strategy issues a confident SELL signal (≥60% confidence).
+- If those conditions are not met, the bot logs a warning (e.g. `[LOSS WARNING]`) but keeps monitoring the trade.
+
+See `EXIT_STRATEGY.md` for the full decision table.
+
+---
+
 ## Step 9: Check Results
 
 After letting it run for a while, stop the bot:

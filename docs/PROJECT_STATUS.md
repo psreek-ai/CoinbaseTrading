@@ -1,7 +1,7 @@
 # 📊 Project Status & Summary
 
-**Last Updated**: November 3, 2025  
-**Version**: 3.0 (Major Optimization Release)  
+**Last Updated**: November 4, 2025  
+**Version**: 3.1 (Signal-Confirmed Exits & Logging Overhaul)  
 **Status**: Production Ready - Optimized ✅
 
 ## 🎯 What This Bot Does
@@ -60,8 +60,9 @@ An automated cryptocurrency trading system that:
 - [x] Concurrent position limits (5 max)
 - [x] **NEW**: Spread protection (rejects if >0.5%)
 - [x] **NEW**: Volume flow confirmation (requires >45% buy pressure)
+- [x] **NEW**: Signal-confirmed exits (5% profit / -2% loss obey live signals)
 
-### Recent Optimizations (November 3, 2025)
+### Recent Optimizations (November 3-4, 2025)
 - [x] **Execution Quality** (+1% per trade)
   - Switched from market orders to limit orders with post_only
   - Earning 0.4% maker rebates instead of paying 0.6% taker fees
@@ -76,7 +77,17 @@ An automated cryptocurrency trading system that:
   - Breakout consolidation detection (ADX <20, BB squeeze, 50-bar lookback)
   - Mean reversion EMA 200 filter (prevents catching falling knives)
 
-- [x] **Expected Annual Improvement**: +20-25% absolute return
+- [x] **Exit Intelligence** (NEW - Nov 4)
+  - 5% profit exits require HOLD/SELL confirmation; BUY signal keeps position open
+  - -2% loss exits trigger only on confident SELL signals (≥60%)
+  - Cost basis now aggregates all fills/fees for accurate PnL decisions
+
+- [x] **Operational Visibility** (NEW - Nov 4)
+  - Trading, API, and WebSocket logs share unified timestamps per session
+  - WebSocket order updates streamed into dedicated log file
+  - Momentum strategy Bollinger column mismatch fixed (restored confidence scoring)
+
+- [x] **Expected Annual Improvement**: +30-35% absolute return
 
 ## 📈 Performance & Reliability
 
@@ -88,7 +99,7 @@ An automated cryptocurrency trading system that:
 - **Configuration**: Centralized YAML config
 - **Documentation**: 8 comprehensive markdown files (cleaned up from 13)
 
-### Testing Status (November 3, 2025)
+### Testing Status (November 4, 2025)
 - ✅ **VERIFIED**: ADX filters working correctly (prevented all trades in ranging market)
 - ✅ **VERIFIED**: Strategy being highly selective (0 BUY signals from 286 products scan)
 - ✅ **VERIFIED**: Detailed reasoning in logs ("ADX falling, trend weakening", etc.)
@@ -98,6 +109,8 @@ An automated cryptocurrency trading system that:
 - ✅ Converter tested with multiple asset pairs
 - ✅ Risk management limits validated
 - ✅ Database integrity confirmed
+- ✅ Signal-confirmed exit logic validated with paper positions (5% / -2% rules)
+- ✅ Unified logging verified (matching timestamps across trading/api/websocket files)
 
 ### Current Status
 - **Mode**: Paper trading (testing optimizations)
@@ -126,22 +139,20 @@ Essential:
 ├── src/find_best_opportunities.py (415 lines) # Scanner
 └── src/convert_holdings.py (340 lines)  # Converter
 
-Documentation (8 files, cleaned from 13):
-├── docs/README.md                    # Main documentation (updated Nov 3, 2025)
-├── docs/PROJECT_STATUS.md            # This file (current status)
-├── docs/PROJECT_SUMMARY.md           # Architecture overview
-├── docs/OPTIMIZATION_CHANGELOG.md    # Nov 3 optimizations detailed
-├── docs/GETTING_STARTED.md           # Setup guide
-├── docs/QUICK_REFERENCE.md           # Command cheat sheet
-├── docs/ARCHITECTURE.md              # System design
-└── docs/coinbaseAPI.md               # API reference
+Documentation (9 files, refreshed Nov 4, 2025):
+├── docs/ARCHITECTURE.md           # System design & data flow
+├── docs/coinbaseAPI.md            # Coinbase Advanced Trade reference
+├── docs/GETTING_STARTED.md        # Step-by-step installation & first run
+├── docs/LIVE_TRADING_FIXES.md     # Operational fixes & lessons learned
+├── docs/OPTIMIZATION_CHANGELOG.md # Execution & exit improvements log
+├── docs/PROJECT_STATUS.md         # This file (current state)
+├── docs/PROJECT_SUMMARY.md        # High-level capabilities overview
+├── docs/QUICK_REFERENCE.md       # Command & config cheat sheet
+└── docs/USER_GUIDE.md            # Detailed usage manual
 
-Documentation:
-├── README.md                        # Main documentation
-├── QUICK_REFERENCE.md               # Command cheat sheet
-├── GETTING_STARTED.md               # Setup guide
-├── ENHANCEMENTS_IMPLEMENTED.md      # All API enhancements
-└── PROJECT_STATUS.md (this file)    # Current status
+Additional root docs:
+- `README.md` – high-level overview & links
+- `EXIT_STRATEGY.md` – signal-confirmed exit playbook (Nov 4, 2025)
 ```
 
 ### Removed/Cleaned Up

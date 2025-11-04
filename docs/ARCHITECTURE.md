@@ -83,6 +83,8 @@ The Coinbase Algorithmic Trading Bot is designed as a modular, event-driven syst
 - WebSocket management for real-time data
 - Price feed management
 - Historical data retrieval
+- Cost basis aggregation & execution diagnostics
+- API/WebSocket logging orchestration
 
 **Key Methods:**
 - `get_portfolio_id()`: Get default portfolio
@@ -90,12 +92,16 @@ The Coinbase Algorithmic Trading Bot is designed as a modular, event-driven syst
 - `find_tradable_products()`: Identify tradable pairs
 - `get_historical_data()`: Fetch OHLCV candles
 - `start_websocket()`: Initialize real-time price feed
+- `calculate_cost_basis()`: Aggregate fill prices + fees for true PnL
+- `enable_api_logging()`: Pipe raw REST responses to rotating log file
+- `_setup_websocket_logger()`: Configure timestamp-aligned WebSocket log
 
 **WebSocket Handling:**
 - Background thread for WebSocket
 - Real-time price updates
 - Automatic reconnection (planned)
 - Thread-safe price dictionary
+- Dedicated log file (`websocket_*.log`) capturing user-channel order updates
 
 ### 4. Strategy Engine (`src/strategies/`)
 
@@ -150,6 +156,7 @@ class BaseStrategy(ABC):
 - Stop loss and take profit management
 - Drawdown protection
 - Exposure limits
+- Signal-confirmed exit evaluation (5% profit / -2% loss)
 
 **Risk Controls:**
 
@@ -168,6 +175,7 @@ class BaseStrategy(ABC):
 - Configurable default percentages
 - Trailing stop support
 - Automatic position closure
+- Signal-confirmed exits consult live strategy signals before closing trades
 
 **Drawdown Protection:**
 - Tracks peak equity
@@ -328,6 +336,10 @@ Runtime Overrides
 - **WARNING**: Unexpected but handled situations
 - **ERROR**: Errors that don't stop execution
 - **CRITICAL**: Fatal errors requiring shutdown
+
+**Log Topology**
+- `trading_bot_YYYYMMDD_HHMMSS.log`, `api_responses_...`, and `websocket_...` now share a session timestamp so events can be correlated across files.
+- The WebSocket logger captures user-channel order updates and low-level feed diagnostics without polluting the main bot log.
 
 ## Concurrency Model
 

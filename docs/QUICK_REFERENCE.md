@@ -1,6 +1,6 @@
 # 🚀 Quick Reference Guide
 
-**Last Updated**: November 3, 2025 (Optimization Release)
+**Last Updated**: November 4, 2025 (Signal-Confirmed Exits)
 
 ## Essential Commands
 
@@ -23,6 +23,9 @@ Ctrl + C
 - `"Volume flow: 65% buy pressure (strong_buy)"` - Volume confirmation
 - `"[PAPER] Limit order (post-only) simulated"` - Maker order execution
 - `"Pullback to middle BB in uptrend"` - Improved momentum entry
+- `"[PROFIT EXIT] ... 5%"` - Signal-confirmed profit exit
+- `"[LOSS EXIT] ... 2%"` - Signal-confirmed loss exit
+- `"[WEBSOCKET] Order update received"` - Real-time Coinbase user-channel events
 
 ### Market Scanner
 ```powershell
@@ -109,6 +112,15 @@ trading:
   candle_granularity: "FIFTEEN_MINUTE"  # 15min candles (RECOMMENDED)
   candle_granularity: "ONE_HOUR"        # 1hr candles
 ```
+
+## Exit Strategy Cheat Sheet
+
+- **Profit Exit**: Price ≥ cost_basis * 1.05 **AND** signal is HOLD or SELL → `[PROFIT EXIT]`
+- **Ride Winners**: Price ≥ cost_basis * 1.05 **AND** signal is BUY → stay in trade
+- **Loss Exit**: Price ≤ cost_basis * 0.98 **AND** signal is SELL with ≥60% confidence → `[LOSS EXIT]`
+- **Monitor Loss**: Price ≤ cost_basis * 0.98 but signal not strong → `[LOSS WARNING]`
+
+Logs live in `logs/trading_bot_*.log`. Full explanation: `EXIT_STRATEGY.md`.
 
 ## Trading Strategies Cheat Sheet
 
