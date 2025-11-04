@@ -98,9 +98,10 @@ class MomentumStrategy(BaseStrategy):
         latest = df.iloc[-1]
         previous = df.iloc[-2]
         
-        upper_bb_col = f'BBU_{self.bb_period}_{self.bb_std}_{self.bb_std}'
-        middle_bb_col = f'BBM_{self.bb_period}_{self.bb_std}_{self.bb_std}'
-        lower_bb_col = f'BBL_{self.bb_period}_{self.bb_std}_{self.bb_std}'
+        # Bollinger Band columns from pandas_ta follow the pattern BBU_<length>_<std>
+        upper_bb_col = f'BBU_{self.bb_period}_{self.bb_std}'
+        middle_bb_col = f'BBM_{self.bb_period}_{self.bb_std}'
+        lower_bb_col = f'BBL_{self.bb_period}_{self.bb_std}'
         macd_col = f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         macd_signal_col = f'MACDs_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         rsi_col = f'RSI_{self.rsi_period}'
