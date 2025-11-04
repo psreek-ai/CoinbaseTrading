@@ -39,7 +39,7 @@ risk_management:
   max_position_size_percent: 0.20  # 20% (increased for small accounts)
   
   # Maximum total exposure (sum of all positions as % of portfolio)
-  max_total_exposure_percent: 0.50  # 50%
+  max_total_exposure_percent: 0.80  # 80% (increased to allow more positions)
   
   # Minimum USD value per trade (keep at $10 to ensure positions are large enough to monitor)
   min_usd_trade_value: 10.0  # $10

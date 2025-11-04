@@ -31,11 +31,24 @@ class BreakoutStrategy(BaseStrategy):
 
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         try:
-            df.ta.atr(length=self.atr_period, append=True)
+            # Add ATR with explicit column mapping
+            atr = df.ta.atr(length=self.atr_period)
+            if atr is not None:
+                df['ATR'] = atr
             
-            df.ta.adx(length=self.adx_length, append=True)
+            # Add ADX with explicit column mapping
+            adx = df.ta.adx(length=self.adx_length)
+            if adx is not None and not adx.empty:
+                df['ADX'] = adx[f'ADX_{self.adx_length}']
             
-            df.ta.bbands(length=self.bb_period, std=self.bb_std, append=True)
+            # Add Bollinger Bands with explicit column mapping
+            bbands = df.ta.bbands(length=self.bb_period, std=self.bb_std)
+            if bbands is not None and not bbands.empty:
+                df['BB_UPPER'] = bbands[f'BBU_{self.bb_period}_{self.bb_std}']
+                df['BB_MIDDLE'] = bbands[f'BBM_{self.bb_period}_{self.bb_std}']
+                df['BB_LOWER'] = bbands[f'BBL_{self.bb_period}_{self.bb_std}']
+                # Calculate BB_Width using explicit columns
+                df['BB_Width'] = ((df['BB_UPPER'] - df['BB_LOWER']) / df['Close']) * 100
             
             df['Volume_MA'] = df['Volume'].rolling(window=self.bb_period).mean()
             df['Volume_MA_Short'] = df['Volume'].rolling(window=self.volume_ma_short_length).mean()
@@ -48,13 +61,6 @@ class BreakoutStrategy(BaseStrategy):
             
             df['Range_Size'] = df['Rolling_High'] - df['Rolling_Low']
             df['Range_Pct'] = (df['Range_Size'] / df['Close']) * 100
-            
-            bb_upper = f'BBU_{self.bb_period}_{self.bb_std}'
-            bb_lower = f'BBL_{self.bb_period}_{self.bb_std}'
-            if bb_upper in df.columns and bb_lower in df.columns:
-                df['BB_Width'] = ((df[bb_upper] - df[bb_lower]) / df['Close']) * 100
-            
-            df.dropna(inplace=True)
             
         except Exception as e:
             logger.error(f"Error adding indicators in BreakoutStrategy: {e}")
@@ -73,17 +79,17 @@ class BreakoutStrategy(BaseStrategy):
         latest = df.iloc[-1]
         previous = df.iloc[-2]
         
-        atr_col = f'ATRr_{self.atr_period}'
-        adx_col = f'ADX_{self.adx_length}'
-        
-        if atr_col not in df.columns:
+        # Check for NaN values in required indicators
+        required_cols = ['ATR', 'Rolling_High', 'Rolling_Low', 'Prev_Rolling_High', 'Prev_Rolling_Low']
+        if latest[required_cols].isnull().any():
+            logger.warning(f"Indicators for {product_id} have NaN on latest candle. Skipping.")
             return TradingSignal('HOLD', confidence=0.0)
         
         in_consolidation = False
-        if adx_col in df.columns:
-            in_consolidation = latest[adx_col] < self.adx_consolidation_threshold
-            if latest[adx_col] > self.adx_trending_threshold:
-                logger.debug(f"{product_id}: ADX too high ({latest[adx_col]:.1f}), already trending")
+        if 'ADX' in df.columns and not pd.isna(latest['ADX']):
+            in_consolidation = latest['ADX'] < self.adx_consolidation_threshold
+            if latest['ADX'] > self.adx_trending_threshold:
+                logger.debug(f"{product_id}: ADX too high ({latest['ADX']:.1f}), already trending")
                 return TradingSignal('HOLD', confidence=0.0)
         
         bb_squeeze = False
@@ -99,9 +105,10 @@ class BreakoutStrategy(BaseStrategy):
             volume_high = latest['Volume'] > latest['Volume_MA'] * self.volume_threshold
         
         atr_expanding = False
-        if len(df) > 5:
-            recent_atr_avg = df[atr_col].iloc[-5:-1].mean()
-            atr_expanding = latest[atr_col] > recent_atr_avg * self.atr_expansion_multiplier
+        if len(df) > 5 and 'ATR' in df.columns:
+            if not df['ATR'].iloc[-5:-1].isnull().any():
+                recent_atr_avg = df['ATR'].iloc[-5:-1].mean()
+                atr_expanding = latest['ATR'] > recent_atr_avg * self.atr_expansion_multiplier
         
         buy_score = 0
         buy_reasons = []
@@ -115,7 +122,7 @@ class BreakoutStrategy(BaseStrategy):
         
         if in_consolidation:
             buy_score += 2
-            buy_reasons.append(f"Breaking from consolidation (ADX: {latest[adx_col]:.1f})")
+            buy_reasons.append(f"Breaking from consolidation (ADX: {latest['ADX']:.1f})")
         
         if bb_squeeze:
             buy_score += 1

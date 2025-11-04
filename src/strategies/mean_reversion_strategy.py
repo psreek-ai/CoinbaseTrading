@@ -25,19 +25,29 @@ class MeanReversionStrategy(BaseStrategy):
     
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         try:
-            df.ta.bbands(length=self.bb_period, std=self.bb_std, append=True)
+            # Add Bollinger Bands with explicit column mapping
+            bbands = df.ta.bbands(length=self.bb_period, std=self.bb_std)
+            if bbands is not None and not bbands.empty:
+                df['BB_UPPER'] = bbands[f'BBU_{self.bb_period}_{self.bb_std}']
+                df['BB_MIDDLE'] = bbands[f'BBM_{self.bb_period}_{self.bb_std}']
+                df['BB_LOWER'] = bbands[f'BBL_{self.bb_period}_{self.bb_std}']
             
-            df.ta.rsi(length=self.rsi_period, append=True)
+            # Add RSI with explicit column mapping
+            rsi = df.ta.rsi(length=self.rsi_period)
+            if rsi is not None:
+                df['RSI'] = rsi
             
-            df.ta.stoch(length=self.stoch_length, append=True)
+            # Add Stochastic with explicit column mapping
+            stoch = df.ta.stoch(length=self.stoch_length)
+            if stoch is not None and not stoch.empty:
+                df['STOCH_K'] = stoch[f'STOCHk_{self.stoch_length}_3_3']
+                df['STOCH_D'] = stoch[f'STOCHd_{self.stoch_length}_3_3']
             
             df['SMA'] = df['Close'].rolling(window=self.mean_lookback).mean()
             
-            df[f'EMA_{self.ema_long_length}'] = df.ta.ema(length=self.ema_long_length)
+            df['EMA_LONG'] = df.ta.ema(length=self.ema_long_length)
             
             df['Distance_From_Mean'] = ((df['Close'] - df['SMA']) / df['SMA']) * 100
-            
-            df.dropna(inplace=True)
             
         except Exception as e:
             logger.error(f"Error adding indicators in MeanReversionStrategy: {e}")
@@ -56,50 +66,48 @@ class MeanReversionStrategy(BaseStrategy):
         latest = df.iloc[-1]
         previous = df.iloc[-2]
         
-        upper_bb_col = f'BBU_{self.bb_period}_{self.bb_std}'
-        lower_bb_col = f'BBL_{self.bb_period}_{self.bb_std}'
-        rsi_col = f'RSI_{self.rsi_period}'
-        stoch_k_col = f'STOCHk_{self.stoch_length}_3_3'
-        stoch_d_col = f'STOCHd_{self.stoch_length}_3_3'
-        
-        if not all(col in df.columns for col in [upper_bb_col, lower_bb_col, rsi_col]):
+        # Check for NaN values in required indicators
+        required_cols = ['BB_UPPER', 'BB_LOWER', 'RSI', 'SMA', 'Distance_From_Mean']
+        if latest[required_cols].isnull().any():
+            logger.warning(f"Indicators for {product_id} have NaN on latest candle. Skipping.")
             return TradingSignal('HOLD', confidence=0.0)
         
         in_uptrend = True
-        ema_long_col = f'EMA_{self.ema_long_length}'
-        if ema_long_col in df.columns:
-            in_uptrend = latest['Close'] > latest[ema_long_col]
+        if 'EMA_LONG' in df.columns and not pd.isna(latest['EMA_LONG']):
+            in_uptrend = latest['Close'] > latest['EMA_LONG']
         
         buy_score = 0
         buy_reasons = []
         
-        if latest['Close'] <= latest[lower_bb_col]:
+        if latest['Close'] <= latest['BB_LOWER']:
             buy_score += 2
-            buy_reasons.append(f"Price at/below lower BB ({latest['Close']:.2f} <= {latest[lower_bb_col]:.2f})")
+            buy_reasons.append(f"Price at/below lower BB ({latest['Close']:.2f} <= {latest['BB_LOWER']:.2f})")
         
-        if latest[rsi_col] < self.rsi_extreme_oversold:
+        if latest['RSI'] < self.rsi_extreme_oversold:
             buy_score += 2
-            buy_reasons.append(f"RSI extremely oversold ({latest[rsi_col]:.1f})")
-        elif latest[rsi_col] < 30:
+            buy_reasons.append(f"RSI extremely oversold ({latest['RSI']:.1f})")
+        elif latest['RSI'] < 30:
             buy_score += 1
-            buy_reasons.append(f"RSI oversold ({latest[rsi_col]:.1f})")
+            buy_reasons.append(f"RSI oversold ({latest['RSI']:.1f})")
         
-        if stoch_k_col in df.columns and stoch_d_col in df.columns:
-            stoch_oversold = latest[stoch_k_col] < 20
-            stoch_crossing_up = latest[stoch_k_col] > latest[stoch_d_col] and previous[stoch_k_col] <= previous[stoch_d_col]
-            
-            if stoch_oversold and stoch_crossing_up:
-                buy_score += 2
-                buy_reasons.append(f"Stochastic oversold + bullish cross ({latest[stoch_k_col]:.1f})")
-            elif stoch_oversold:
-                buy_score += 1
-                buy_reasons.append("Stochastic oversold")
+        if 'STOCH_K' in df.columns and 'STOCH_D' in df.columns:
+            if not pd.isna(latest['STOCH_K']) and not pd.isna(latest['STOCH_D']):
+                stoch_oversold = latest['STOCH_K'] < 20
+                stoch_crossing_up = (latest['STOCH_K'] > latest['STOCH_D'] and 
+                                    previous['STOCH_K'] <= previous['STOCH_D'])
+                
+                if stoch_oversold and stoch_crossing_up:
+                    buy_score += 2
+                    buy_reasons.append(f"Stochastic oversold + bullish cross ({latest['STOCH_K']:.1f})")
+                elif stoch_oversold:
+                    buy_score += 1
+                    buy_reasons.append("Stochastic oversold")
         
         if latest['Distance_From_Mean'] < self.distance_from_mean_threshold:
             buy_score += 1
             buy_reasons.append(f"Price {latest['Distance_From_Mean']:.1f}% below mean")
         
-        if previous['Close'] < previous[lower_bb_col] and latest['Close'] > latest[lower_bb_col]:
+        if previous['Close'] < previous['BB_LOWER'] and latest['Close'] > latest['BB_LOWER']:
             buy_score += 1
             buy_reasons.append("Bouncing from lower BB")
         
@@ -114,33 +122,35 @@ class MeanReversionStrategy(BaseStrategy):
         sell_score = 0
         sell_reasons = []
         
-        if latest['Close'] >= latest[upper_bb_col]:
+        if latest['Close'] >= latest['BB_UPPER']:
             sell_score += 2
-            sell_reasons.append(f"Price at/above upper BB ({latest['Close']:.2f} >= {latest[upper_bb_col]:.2f})")
+            sell_reasons.append(f"Price at/above upper BB ({latest['Close']:.2f} >= {latest['BB_UPPER']:.2f})")
         
-        if latest[rsi_col] > self.rsi_extreme_overbought:
+        if latest['RSI'] > self.rsi_extreme_overbought:
             sell_score += 2
-            sell_reasons.append(f"RSI extremely overbought ({latest[rsi_col]:.1f})")
-        elif latest[rsi_col] > 70:
+            sell_reasons.append(f"RSI extremely overbought ({latest['RSI']:.1f})")
+        elif latest['RSI'] > 70:
             sell_score += 1
-            sell_reasons.append(f"RSI overbought ({latest[rsi_col]:.1f})")
+            sell_reasons.append(f"RSI overbought ({latest['RSI']:.1f})")
         
-        if stoch_k_col in df.columns and stoch_d_col in df.columns:
-            stoch_overbought = latest[stoch_k_col] > 80
-            stoch_crossing_down = latest[stoch_k_col] < latest[stoch_d_col] and previous[stoch_k_col] >= previous[stoch_d_col]
-            
-            if stoch_overbought and stoch_crossing_down:
-                sell_score += 2
-                sell_reasons.append(f"Stochastic overbought + bearish cross ({latest[stoch_k_col]:.1f})")
-            elif stoch_overbought:
-                sell_score += 1
-                buy_reasons.append("Stochastic overbought")
+        if 'STOCH_K' in df.columns and 'STOCH_D' in df.columns:
+            if not pd.isna(latest['STOCH_K']) and not pd.isna(latest['STOCH_D']):
+                stoch_overbought = latest['STOCH_K'] > 80
+                stoch_crossing_down = (latest['STOCH_K'] < latest['STOCH_D'] and 
+                                      previous['STOCH_K'] >= previous['STOCH_D'])
+                
+                if stoch_overbought and stoch_crossing_down:
+                    sell_score += 2
+                    sell_reasons.append(f"Stochastic overbought + bearish cross ({latest['STOCH_K']:.1f})")
+                elif stoch_overbought:
+                    sell_score += 1
+                    buy_reasons.append("Stochastic overbought")
 
         if latest['Distance_From_Mean'] > abs(self.distance_from_mean_threshold):
             sell_score += 1
             sell_reasons.append(f"Price {latest['Distance_From_Mean']:.1f}% above mean")
 
-        if previous['Close'] > previous[upper_bb_col] and latest['Close'] < latest[upper_bb_col]:
+        if previous['Close'] > previous['BB_UPPER'] and latest['Close'] < latest['BB_UPPER']:
             sell_score += 1
             sell_reasons.append("Rejecting from upper BB")
 
@@ -157,5 +167,5 @@ class MeanReversionStrategy(BaseStrategy):
                                metadata={'reasons': sell_reasons, 'score': sell_score})
 
         return TradingSignal('HOLD', confidence=0.5,
-                           metadata={'rsi': latest[rsi_col],
+                           metadata={'rsi': latest['RSI'],
                                    'distance_from_mean': latest['Distance_From_Mean']})

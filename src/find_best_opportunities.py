@@ -43,12 +43,12 @@ def analyze_all_products():
     portfolio_id = bot.api.get_portfolio_id()
     balances = bot.api.get_account_balances(portfolio_id, min_usd_equivalent=Decimal('1.0'))
     
-    # Analyze current holdings (uses TradingBot's logic)
-    bot._analyze_current_holdings(balances)
+    # Analyze current holdings (uses MarketScanner's logic)
+    bot.market_scanner.analyze_current_holdings(balances, bot._shutdown_event)
     
-    # Scan all products for opportunities (uses TradingBot's optimized parallel scanning)
+    # Scan all products for opportunities (uses MarketScanner's optimized parallel scanning)
     print("\nFetching all available products...")
-    opportunities = bot._scan_all_products()
+    opportunities = bot.market_scanner.scan_all_products(bot._shutdown_event)
     
     print("\n" + "=" * 80)
     print("TOP TRADING OPPORTUNITIES (Ranked by Signal Strength)")

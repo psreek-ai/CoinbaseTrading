@@ -123,20 +123,35 @@ class TradeExecutor:
             return
 
         # Check if we can open this position
-        open_positions = self.db.get_open_positions()
-        current_exposure = Decimal('0')
-
-        for pos in open_positions:
-            try:
-                size = Decimal(str(pos['base_size']))
-                price = Decimal(str(pos.get('current_price', pos['entry_price'])))
-                current_exposure += (size * price) / total_equity
-            except Exception as e:
-                logger.error(f"Error calculating exposure: {e}")
+        # Calculate current exposure from LIVE balances instead of stale database positions
+        current_positions_value = Decimal('0')
+        num_positions = 0
+        stablecoins = {'USD', 'USDC', 'DAI', 'USDT', 'BUSD', 'EURC'}
+        
+        logger.info(f"Calculating exposure from live balances (Total equity: ${total_equity:.2f}):")
+        
+        for asset, balance in balances.items():
+            if asset in stablecoins or balance <= 0:
+                continue
+                
+            # Get current price for this asset
+            asset_price = self.api.get_latest_price(f"{asset}-USDC")
+            if not asset_price:
+                asset_price = self.api.get_latest_price(f"{asset}-USD")
+            
+            if asset_price:
+                asset_value = balance * asset_price
+                current_positions_value += asset_value
+                num_positions += 1
+                logger.info(f"  - {asset}: {balance:.4f} @ ${asset_price:.4f} = ${asset_value:.2f}")
+        
+        current_exposure = current_positions_value / total_equity if total_equity > 0 else Decimal('0')
+        
+        logger.info(f"Current exposure: ${current_positions_value:.2f} / ${total_equity:.2f} = {current_exposure:.2%} ({num_positions} positions)")
 
         position_value = position_size * entry_price
         can_open, reason = self.risk_manager.can_open_position(
-            len(open_positions), current_exposure, total_equity, position_value
+            num_positions, current_exposure, total_equity, position_value
         )
 
         if not can_open:

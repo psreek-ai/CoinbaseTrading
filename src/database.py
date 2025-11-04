@@ -5,6 +5,7 @@ Uses SQLite for simplicity and portability.
 
 import sqlite3
 import json
+import threading
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional, Any
@@ -27,6 +28,7 @@ class DatabaseManager:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = None
+        self.db_lock = threading.Lock()  # Thread safety for concurrent DB access
         self._initialize_database()
     
     def _initialize_database(self):
@@ -36,7 +38,7 @@ class DatabaseManager:
         
         cursor = self.conn.cursor()
         
-        # Orders table
+        # Orders table - using TEXT for Decimal precision
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,14 +47,14 @@ class DatabaseManager:
                 side TEXT NOT NULL,
                 order_type TEXT NOT NULL,
                 status TEXT NOT NULL,
-                base_size REAL,
-                quote_size REAL,
-                entry_price REAL,
-                stop_loss REAL,
-                take_profit REAL,
-                filled_price REAL,
-                filled_size REAL,
-                fees REAL,
+                base_size TEXT,
+                quote_size TEXT,
+                entry_price TEXT,
+                stop_loss TEXT,
+                take_profit TEXT,
+                filled_price TEXT,
+                filled_size TEXT,
+                fees TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 filled_at TIMESTAMP,
                 cancelled_at TIMESTAMP,
@@ -60,18 +62,18 @@ class DatabaseManager:
             )
         """)
         
-        # Positions table
+        # Positions table - using TEXT for Decimal precision
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id TEXT UNIQUE NOT NULL,
-                base_size REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                current_price REAL,
-                stop_loss REAL,
-                take_profit REAL,
-                unrealized_pnl REAL,
-                realized_pnl REAL DEFAULT 0,
+                base_size TEXT NOT NULL,
+                entry_price TEXT NOT NULL,
+                current_price TEXT,
+                stop_loss TEXT,
+                take_profit TEXT,
+                unrealized_pnl TEXT,
+                realized_pnl TEXT DEFAULT '0',
                 entry_order_id TEXT,
                 opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -81,20 +83,20 @@ class DatabaseManager:
             )
         """)
         
-        # Performance metrics table
+        # Performance metrics table - using TEXT for Decimal precision
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS performance_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                total_equity REAL,
-                available_balance REAL,
-                total_positions_value REAL,
-                daily_pnl REAL,
-                total_pnl REAL,
-                win_rate REAL,
-                sharpe_ratio REAL,
-                sortino_ratio REAL,
-                max_drawdown REAL,
+                total_equity TEXT,
+                available_balance TEXT,
+                total_positions_value TEXT,
+                daily_pnl TEXT,
+                total_pnl TEXT,
+                win_rate TEXT,
+                sharpe_ratio TEXT,
+                sortino_ratio TEXT,
+                max_drawdown TEXT,
                 num_trades INTEGER,
                 num_wins INTEGER,
                 num_losses INTEGER,
@@ -102,18 +104,18 @@ class DatabaseManager:
             )
         """)
         
-        # Trade history table (for completed trades)
+        # Trade history table - using TEXT for Decimal precision
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS trade_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id TEXT NOT NULL,
                 side TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                exit_price REAL NOT NULL,
-                size REAL NOT NULL,
-                pnl REAL NOT NULL,
-                pnl_percent REAL NOT NULL,
-                fees REAL DEFAULT 0,
+                entry_price TEXT NOT NULL,
+                exit_price TEXT NOT NULL,
+                size TEXT NOT NULL,
+                pnl TEXT NOT NULL,
+                pnl_percent TEXT NOT NULL,
+                fees TEXT DEFAULT '0',
                 holding_time_seconds INTEGER,
                 entry_time TIMESTAMP NOT NULL,
                 exit_time TIMESTAMP NOT NULL,
@@ -132,14 +134,14 @@ class DatabaseManager:
             )
         """)
         
-        # Equity curve table
+        # Equity curve table - using TEXT for Decimal precision
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS equity_curve (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                equity REAL NOT NULL,
-                cash REAL NOT NULL,
-                positions_value REAL NOT NULL
+                equity TEXT NOT NULL,
+                cash TEXT NOT NULL,
+                positions_value TEXT NOT NULL
             )
         """)
         
@@ -153,108 +155,148 @@ class DatabaseManager:
         self.conn.commit()
         logger.info(f"Database initialized at {self.db_path}")
     
+    def _decimal_to_str(self, value: Any) -> Optional[str]:
+        """
+        Convert Decimal values to string for storage.
+        
+        Args:
+            value: Value to convert (Decimal, float, int, or None)
+            
+        Returns:
+            String representation or None
+        """
+        if value is None:
+            return None
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, (float, int)):
+            return str(Decimal(str(value)))
+        return str(value)
+    
+    def _str_to_decimal(self, value: Any) -> Optional[Decimal]:
+        """
+        Convert string values back to Decimal.
+        
+        Args:
+            value: Value to convert (string or None)
+            
+        Returns:
+            Decimal or None
+        """
+        if value is None or value == '' or value == 'None':
+            return None
+        try:
+            return Decimal(str(value))
+        except Exception as e:
+            logger.warning(f"Could not convert '{value}' to Decimal: {e}")
+            return None
+    
     def insert_order(self, order_data: Dict[str, Any]) -> int:
         """Insert a new order record."""
-        cursor = self.conn.cursor()
-        
-        # Convert Decimal to float and handle metadata
-        processed_data = self._process_order_data(order_data)
-        
-        cursor.execute("""
-            INSERT INTO orders (
-                client_order_id, product_id, side, order_type, status,
-                base_size, quote_size, entry_price, stop_loss, take_profit, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            processed_data['client_order_id'],
-            processed_data['product_id'],
-            processed_data['side'],
-            processed_data['order_type'],
-            processed_data['status'],
-            processed_data.get('base_size'),
-            processed_data.get('quote_size'),
-            processed_data.get('entry_price'),
-            processed_data.get('stop_loss'),
-            processed_data.get('take_profit'),
-            json.dumps(processed_data.get('metadata', {}))
-        ))
-        
-        self.conn.commit()
-        return cursor.lastrowid
+        with self.db_lock:
+            cursor = self.conn.cursor()
+            
+            # Convert Decimal to string and handle metadata
+            processed_data = self._process_order_data(order_data)
+            
+            cursor.execute("""
+                INSERT INTO orders (
+                    client_order_id, product_id, side, order_type, status,
+                    base_size, quote_size, entry_price, stop_loss, take_profit, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                processed_data['client_order_id'],
+                processed_data['product_id'],
+                processed_data['side'],
+                processed_data['order_type'],
+                processed_data['status'],
+                self._decimal_to_str(processed_data.get('base_size')),
+                self._decimal_to_str(processed_data.get('quote_size')),
+                self._decimal_to_str(processed_data.get('entry_price')),
+                self._decimal_to_str(processed_data.get('stop_loss')),
+                self._decimal_to_str(processed_data.get('take_profit')),
+                json.dumps(processed_data.get('metadata', {}))
+            ))
+            
+            self.conn.commit()
+            return cursor.lastrowid
     
     def update_order_status(self, client_order_id: str, status: str, 
                           filled_price: float = None, filled_size: float = None,
                           fees: float = None):
         """Update order status and fill information."""
-        cursor = self.conn.cursor()
-        
-        update_fields = ["status = ?"]
-        params = [status]
-        
-        if filled_price is not None:
-            update_fields.append("filled_price = ?")
-            params.append(float(filled_price))
-        
-        if filled_size is not None:
-            update_fields.append("filled_size = ?")
-            params.append(float(filled_size))
-        
-        if fees is not None:
-            update_fields.append("fees = ?")
-            params.append(float(fees))
-        
-        if status == 'filled':
-            update_fields.append("filled_at = CURRENT_TIMESTAMP")
-        elif status == 'cancelled':
-            update_fields.append("cancelled_at = CURRENT_TIMESTAMP")
-        
-        params.append(client_order_id)
-        
-        query = f"UPDATE orders SET {', '.join(update_fields)} WHERE client_order_id = ?"
-        cursor.execute(query, params)
-        self.conn.commit()
+        with self.db_lock:
+            cursor = self.conn.cursor()
+            
+            update_fields = ["status = ?"]
+            params = [status]
+            
+            if filled_price is not None:
+                update_fields.append("filled_price = ?")
+                params.append(self._decimal_to_str(filled_price))
+            
+            if filled_size is not None:
+                update_fields.append("filled_size = ?")
+                params.append(self._decimal_to_str(filled_size))
+            
+            if fees is not None:
+                update_fields.append("fees = ?")
+                params.append(self._decimal_to_str(fees))
+            
+            if status == 'filled':
+                update_fields.append("filled_at = CURRENT_TIMESTAMP")
+            elif status == 'cancelled':
+                update_fields.append("cancelled_at = CURRENT_TIMESTAMP")
+            
+            params.append(client_order_id)
+            
+            query = f"UPDATE orders SET {', '.join(update_fields)} WHERE client_order_id = ?"
+            cursor.execute(query, params)
+            self.conn.commit()
     
     def insert_position(self, position_data: Dict[str, Any]) -> int:
         """Insert a new position record."""
-        cursor = self.conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO positions (
-                product_id, base_size, entry_price, current_price,
-                stop_loss, take_profit, entry_order_id, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            position_data['product_id'],
-            float(position_data['base_size']),
-            float(position_data['entry_price']),
-            float(position_data.get('current_price', position_data['entry_price'])),
-            float(position_data.get('stop_loss', 0)),
-            float(position_data.get('take_profit', 0)),
-            position_data.get('entry_order_id'),
-            json.dumps(position_data.get('metadata', {}))
-        ))
-        
-        self.conn.commit()
-        return cursor.lastrowid
+        with self.db_lock:
+            cursor = self.conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO positions (
+                    product_id, base_size, entry_price, current_price,
+                    stop_loss, take_profit, entry_order_id, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                position_data['product_id'],
+                self._decimal_to_str(position_data['base_size']),
+                self._decimal_to_str(position_data['entry_price']),
+                self._decimal_to_str(position_data.get('current_price', position_data['entry_price'])),
+                self._decimal_to_str(position_data.get('stop_loss', 0)),
+                self._decimal_to_str(position_data.get('take_profit', 0)),
+                position_data.get('entry_order_id'),
+                json.dumps(position_data.get('metadata', {}))
+            ))
+            
+            self.conn.commit()
+            return cursor.lastrowid
     
     def update_position(self, product_id: str, **kwargs):
         """Update position fields."""
-        cursor = self.conn.cursor()
-        
-        update_fields = []
-        params = []
-        
-        for key, value in kwargs.items():
-            if value is not None:
-                update_fields.append(f"{key} = ?")
-                if isinstance(value, (Decimal, float)):
-                    params.append(float(value))
-                else:
-                    params.append(value)
-        
-        if update_fields:
-            update_fields.append("updated_at = CURRENT_TIMESTAMP")
-            params.append(product_id)
+        with self.db_lock:
+            cursor = self.conn.cursor()
+            
+            update_fields = []
+            params = []
+            
+            for key, value in kwargs.items():
+                if value is not None:
+                    update_fields.append(f"{key} = ?")
+                    if isinstance(value, (Decimal, float, int)):
+                        params.append(self._decimal_to_str(value))
+                    else:
+                        params.append(value)
+            
+            if update_fields:
+                update_fields.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(product_id)
             
             query = f"UPDATE positions SET {', '.join(update_fields)} WHERE product_id = ? AND status = 'open'"
             cursor.execute(query, params)

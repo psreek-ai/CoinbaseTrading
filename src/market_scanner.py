@@ -108,17 +108,17 @@ class MarketScanner:
                     elif rsi is not None:
                         indicators = f"RSI:{rsi:5.1f}"
 
-                    # Log each product scan with details
+                    # Log each product scan with details (always show confidence)
+                    confidence_pct = f"{signal.confidence:.1%}"
                     if signal.action == 'BUY':
-                        confidence_pct = f"{signal.confidence:.1%}"
                         reason = getattr(signal, 'reason', signal.metadata.get('reason', ''))
-                        logger.info(f"[SCAN] {product_id:15s} - BUY {confidence_pct:>6s} @ ${latest_price:>10.4f} | {indicators} | {reason}")
+                        logger.info(f"[SCAN] {product_id:15s} - BUY  {confidence_pct:>6s} @ ${latest_price:>10.4f} | {indicators} | {reason}")
                     elif signal.action == 'SELL':
                         reason = getattr(signal, 'reason', signal.metadata.get('reason', ''))
-                        logger.info(f"[SCAN] {product_id:15s} - SELL      @ ${latest_price:>10.4f} | {indicators} | {reason}")
+                        logger.info(f"[SCAN] {product_id:15s} - SELL {confidence_pct:>6s} @ ${latest_price:>10.4f} | {indicators} | {reason}")
                     else:
                         # For HOLD, use debug level
-                        logger.debug(f"[SCAN] {product_id:15s} - HOLD      @ ${latest_price:>10.4f} | {indicators}")
+                        logger.debug(f"[SCAN] {product_id:15s} - HOLD {confidence_pct:>6s} @ ${latest_price:>10.4f} | {indicators}")
 
                     # Return ALL BUY signals (both above and below threshold) for tracking
                     if signal.action == 'BUY':

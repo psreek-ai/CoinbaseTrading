@@ -389,24 +389,58 @@ class CoinbaseAPI:
         self._initialize_ws_client()
         
         def run_ws():
-            try:
-                self.ws_client.open()
-                
-                # Subscribe to ticker channel for prices
-                self.ws_client.subscribe(product_ids=product_ids, channels=["ticker"])
-                logger.info(f"Subscribed to ticker for {len(product_ids)} products")
-                
-                # Subscribe to user channel for order updates if enabled
-                if enable_user_channel:
-                    self.ws_client.subscribe(product_ids=product_ids, channels=["user"])
-                    logger.info(f"Subscribed to user channel for real-time order updates")
-                
-                self.ws_client.run_forever_with_exception_check()
-            except Exception as e:
-                logger.error(f"WebSocket error: {e}")
-            finally:
-                if self.ws_client:
-                    self.ws_client.close()
+            """WebSocket runner with automatic reconnection."""
+            reconnect_delay = 10  # seconds
+            max_reconnect_delay = 300  # 5 minutes
+            
+            while not self._shutdown_event.is_set():
+                try:
+                    logger.info("Initializing WebSocket connection...")
+                    self._initialize_ws_client()
+                    
+                    self.ws_client.open()
+                    logger.info("WebSocket connection opened")
+                    
+                    # Subscribe to ticker channel for prices
+                    self.ws_client.subscribe(product_ids=product_ids, channels=["ticker"])
+                    logger.info(f"Subscribed to ticker for {len(product_ids)} products")
+                    
+                    # Subscribe to user channel for order updates if enabled
+                    if enable_user_channel:
+                        self.ws_client.subscribe(product_ids=product_ids, channels=["user"])
+                        logger.info(f"Subscribed to user channel for real-time order updates")
+                    
+                    # Reset reconnect delay on successful connection
+                    reconnect_delay = 10
+                    
+                    # Run WebSocket until it disconnects
+                    self.ws_client.run_forever_with_exception_check()
+                    
+                except Exception as e:
+                    if self._shutdown_event.is_set():
+                        logger.info("WebSocket shutting down gracefully")
+                        break
+                    
+                    logger.error(f"WebSocket error: {e}")
+                    logger.info(f"Attempting to reconnect in {reconnect_delay} seconds...")
+                    
+                    # Wait before reconnecting, but check for shutdown periodically
+                    for _ in range(reconnect_delay):
+                        if self._shutdown_event.is_set():
+                            break
+                        time.sleep(1)
+                    
+                    # Exponential backoff for reconnect delay
+                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+                    
+                finally:
+                    if self.ws_client:
+                        try:
+                            self.ws_client.close()
+                        except Exception as close_error:
+                            logger.debug(f"Error closing WebSocket: {close_error}")
+            
+            logger.info("WebSocket thread exited")
         
         ws_thread = Thread(target=run_ws, name="WebSocketThread", daemon=True)
         ws_thread.start()

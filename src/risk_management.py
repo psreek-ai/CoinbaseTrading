@@ -1,13 +1,10 @@
-from decimal import Decimal, getcontext, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN
 import decimal
 from typing import Dict, Optional, Tuple
 import logging
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
-
-# Set precision for Decimal calculations
-getcontext().prec = 10
 
 
 class RiskManager:
@@ -82,16 +79,17 @@ class RiskManager:
             # First do the division
             raw_position_size = risk_amount / risk_per_unit
             
-            # Try to quantize - if it fails, use a simpler rounding approach
-            try:
-                position_size = raw_position_size.quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
-            except decimal.InvalidOperation:
-                # Quantize failed - likely due to precision issues
-                # Use simpler approach: round to 8 decimal places
-                position_size = Decimal(str(round(float(raw_position_size), 8)))
-                logger.debug(f"Used simple rounding for position size: {position_size}")
+            # Check if result is finite
+            if not raw_position_size.is_finite():
+                logger.error(f"Position size calculation resulted in non-finite value")
+                logger.error(f"  risk_amount={risk_amount}, risk_per_unit={risk_per_unit}")
+                logger.error(f"  entry_price={entry_price}, stop_loss_price={stop_loss_price}")
+                return Decimal('0'), {'error': 'non_finite_result'}
             
-        except (decimal.Overflow, decimal.DivisionByZero) as e:
+            # Quantize to 8 decimal places
+            position_size = raw_position_size.quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+            
+        except (decimal.Overflow, decimal.DivisionByZero, decimal.InvalidOperation) as e:
             logger.error(f"Position size calculation failed: {e}")
             logger.error(f"  risk_amount={risk_amount}, risk_per_unit={risk_per_unit}")
             logger.error(f"  entry_price={entry_price}, stop_loss_price={stop_loss_price}")

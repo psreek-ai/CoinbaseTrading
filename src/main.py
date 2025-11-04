@@ -324,17 +324,51 @@ class TradingBot:
                     conversions_made += 1
                     buy_index += 1
                     
-                    # Log to trade history
-                    self._log_trade_history({
-                        'timestamp': datetime.now(UTC).isoformat(),
-                        'action': 'MARKET_SELL_TO_USDC',
-                        'product_id': sell_product_id,
-                        'from_asset': from_asset,
-                        'amount': str(from_balance),
-                        'sell_confidence': sell['confidence'],
-                        'reason': f'Convert SELL to USDC for buying {to_asset}',
-                        'order_id': sell_result.get('order_id', 'N/A')
-                    })
+                    # Close position in database to update exposure calculation
+                    try:
+                        # Get position details for PNL calculation
+                        position = self.db.get_position(sell_product_id)
+                        if position:
+                            # Calculate exit price and PNL
+                            entry_price = float(position.get('entry_price', 0))
+                            current_price = float(position.get('current_price', entry_price))
+                            base_size = float(position.get('base_size', from_balance))
+                            
+                            # Estimate PNL (entry to current price)
+                            pnl = (current_price - entry_price) * base_size
+                            
+                            # Close the position
+                            self.db.close_position(sell_product_id, current_price, pnl)
+                            logger.info(f"   Closed position for {sell_product_id} (PnL: ${pnl:.2f})")
+                        else:
+                            logger.warning(f"   No open position found for {sell_product_id} - may have been opened before database tracking")
+                    except Exception as e:
+                        logger.error(f"Failed to close position for {sell_product_id}: {e}")
+                    
+                    # Log conversion to database
+                    try:
+                        self.db.insert_trade_history({
+                            'product_id': sell_product_id,
+                            'side': 'SELL',
+                            'entry_price': 0,  # Will be filled from order details
+                            'exit_price': 0,
+                            'size': from_balance,
+                            'pnl': 0,
+                            'pnl_percent': 0,
+                            'entry_time': datetime.now(UTC).isoformat(),
+                            'exit_time': datetime.now(UTC).isoformat(),
+                            'strategy': 'auto_convert',
+                            'exit_reason': f'Convert SELL to USDC for buying {to_asset}',
+                            'metadata': {
+                                'action': 'MARKET_SELL_TO_USDC',
+                                'from_asset': from_asset,
+                                'to_asset': to_asset,
+                                'sell_confidence': sell['confidence'],
+                                'order_id': sell_result.get('order_id', 'N/A')
+                            }
+                        })
+                    except Exception as e:
+                        logger.error(f"Failed to log trade history: {e}")
                     
                     # Rate limiting between orders
                     time.sleep(2)
@@ -411,18 +445,32 @@ class TradingBot:
                     
                     conversions_made += 1
                     
-                    self._log_trade_history({
-                        'timestamp': datetime.now(UTC).isoformat(),
-                        'action': 'MARKET_SELL_HOLD_TO_USDC',
-                        'product_id': sell_product_id,
-                        'from_asset': from_asset,
-                        'amount': str(from_balance),
-                        'hold_confidence': hold_confidence,
-                        'buy_confidence': buy_confidence,
-                        'confidence_improvement': confidence_diff,
-                        'reason': f'Convert HOLD to USDC for buying {to_asset}',
-                        'order_id': sell_result.get('order_id', 'N/A')
-                    })
+                    # Log conversion to database
+                    try:
+                        self.db.insert_trade_history({
+                            'product_id': sell_product_id,
+                            'side': 'SELL',
+                            'entry_price': 0,
+                            'exit_price': 0,
+                            'size': from_balance,
+                            'pnl': 0,
+                            'pnl_percent': 0,
+                            'entry_time': datetime.now(UTC).isoformat(),
+                            'exit_time': datetime.now(UTC).isoformat(),
+                            'strategy': 'auto_convert',
+                            'exit_reason': f'Convert HOLD to USDC for buying {to_asset}',
+                            'metadata': {
+                                'action': 'MARKET_SELL_HOLD_TO_USDC',
+                                'from_asset': from_asset,
+                                'to_asset': to_asset,
+                                'hold_confidence': hold_confidence,
+                                'buy_confidence': buy_confidence,
+                                'confidence_improvement': confidence_diff,
+                                'order_id': sell_result.get('order_id', 'N/A')
+                            }
+                        })
+                    except Exception as e:
+                        logger.error(f"Failed to log trade history: {e}")
                 else:
                     logger.error(f"[FAILED] Could not market sell {from_asset} to USDC")
                     
@@ -437,154 +485,6 @@ class TradingBot:
             logger.info("\n" + "=" * 80)
             logger.info(f"[COMPLETE] AUTO-CONVERSION: {conversions_made} conversions executed")
             logger.info("=" * 80 + "\n")
-    
-    def _scan_all_products(self):
-        """
-        Scan all tradable products for opportunities (OPTIMIZED).
-        Uses parallel processing and caching for faster scanning.
-        
-        Returns:
-            List of opportunities sorted by confidence
-        """
-        opportunities = []
-        
-        try:
-            # Get all available products with tradability status
-            products_response = self.api.rest_client.get_products(get_tradability_status=True)
-            all_products = []
-            
-            if hasattr(products_response, 'products'):
-                for product in products_response.products:
-                    # Skip view-only products
-                    if hasattr(product, 'view_only') and product.view_only:
-                        continue
-                    
-                    # Filter for USD/USDC and tradable products
-                    if (product.quote_currency_id in ['USD', 'USDC'] and 
-                        not product.is_disabled and 
-                        product.status == 'online' and
-                        product.trading_disabled == False):
-                        all_products.append(product.product_id)
-            
-            logger.info(f"Scanning {len(all_products)} tradable products in parallel...")
-            
-            granularity = self.config.get('trading.candle_granularity', 'FIFTEEN_MINUTE')
-            periods = self.config.get('trading.candle_periods_for_analysis', 200)
-            min_confidence = self.config.get('trading.min_signal_confidence', 0.5)
-            
-            # OPTIMIZATION: Use parallel processing with ThreadPoolExecutor
-            # Scan products in batches to avoid overwhelming the API
-            max_workers = self.config.get('trading.max_scan_workers', 10)
-            max_workers = min(max_workers, len(all_products))  # Don't exceed number of products
-            
-            def analyze_product_quick(product_id):
-                """Quick product analysis for scanning."""
-                try:
-                    # Get historical data
-                    df = self.api.get_historical_data(product_id, granularity, periods)
-                    
-                    if df.empty or len(df) < 50:
-                        logger.debug(f"[SCAN] {product_id:15s} - Insufficient data (< 50 candles)")
-                        return None
-                    
-                    # Add indicators first so we can display them
-                    df = self.strategy.add_indicators(df)
-                    
-                    # Get signal
-                    signal = self.strategy.analyze(df, product_id)
-                    latest_price = df['Close'].iloc[-1]
-                    
-                    # Extract key indicators for display (check what columns actually exist)
-                    adx = None
-                    rsi = None
-                    
-                    # Try to find ADX column
-                    adx_cols = [col for col in df.columns if 'ADX' in col]
-                    if adx_cols:
-                        adx = df[adx_cols[0]].iloc[-1]
-                    
-                    # Try to find RSI column
-                    rsi_cols = [col for col in df.columns if 'RSI' in col]
-                    if rsi_cols:
-                        rsi = df[rsi_cols[0]].iloc[-1]
-                    
-                    # Build indicator string
-                    indicators = ""
-                    if adx is not None and rsi is not None:
-                        indicators = f"ADX:{adx:5.1f} RSI:{rsi:5.1f}"
-                    elif adx is not None:
-                        indicators = f"ADX:{adx:5.1f}"
-                    elif rsi is not None:
-                        indicators = f"RSI:{rsi:5.1f}"
-                    
-                    # Log each product scan with details
-                    if signal.action == 'BUY':
-                        confidence_pct = f"{signal.confidence:.1%}"
-                        reason = getattr(signal, 'reason', signal.metadata.get('reason', ''))
-                        logger.info(f"[SCAN] {product_id:15s} - BUY {confidence_pct:>6s} @ ${latest_price:>10.4f} | {indicators} | {reason}")
-                    elif signal.action == 'SELL':
-                        reason = getattr(signal, 'reason', signal.metadata.get('reason', ''))
-                        logger.info(f"[SCAN] {product_id:15s} - SELL      @ ${latest_price:>10.4f} | {indicators} | {reason}")
-                    else:
-                        # For HOLD, use debug level
-                        logger.debug(f"[SCAN] {product_id:15s} - HOLD      @ ${latest_price:>10.4f} | {indicators}")
-                    
-                    # Return ALL BUY signals (both above and below threshold) for tracking
-                    if signal.action == 'BUY':
-                        return {
-                            'product_id': product_id,
-                            'signal': signal.action,
-                            'confidence': signal.confidence,
-                            'price': latest_price,
-                            'metadata': signal.metadata,
-                            'above_threshold': signal.confidence >= min_confidence
-                        }
-                    
-                except Exception as e:
-                    logger.warning(f"[SCAN] {product_id:15s} - Error: {e}")
-                    
-                return None
-            
-            # Process products in parallel
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(analyze_product_quick, product_id): product_id 
-                          for product_id in all_products}
-                
-                completed = 0
-                all_buy_signals = []  # Track ALL BUY signals for top 3 logging
-                
-                for future in as_completed(futures):
-                    if self._shutdown_event.is_set():
-                        logger.info("Shutdown requested, stopping scan...")
-                        break
-                    
-                    completed += 1
-                    if completed % 25 == 0:  # Progress update every 25 products
-                        logger.info(f"Scanned {completed}/{len(all_products)} products...")
-                    
-                    result = future.result()
-                    if result:
-                        all_buy_signals.append(result)
-                        if result['above_threshold']:
-                            opportunities.append(result)
-            
-            # Sort all BUY signals by confidence
-            all_buy_signals.sort(key=lambda x: x['confidence'], reverse=True)
-            self._top_buy_signals = all_buy_signals[:3]  # Store top 3 for logging
-            
-            logger.debug(f"Total BUY signals found: {len(all_buy_signals)}")
-            
-            # Sort opportunities (above threshold) by confidence
-            opportunities.sort(key=lambda x: x['confidence'], reverse=True)
-            
-            logger.info(f"Scan complete: Found {len(opportunities)} opportunities above {min_confidence:.0%} confidence")
-            if len(all_buy_signals) > 0:
-                logger.info(f"(Total BUY signals including below threshold: {len(all_buy_signals)})")
-            
-        except Exception as e:
-            logger.error(f"Error in product scan: {e}", exc_info=True)
-        
-        return opportunities
     
     def _check_open_orders(self):
         """
@@ -952,7 +852,7 @@ class TradingBot:
                                     if profit_pct >= 5.0 and current_signal in ['HOLD', 'SELL']:
                                         reason = f"5% PROFIT + {current_signal} SIGNAL ({profit_pct:.2f}%, conf={signal_confidence:.1%})"
                                         logger.info(f"[PROFIT EXIT] {product_id}: {reason}")
-                                        self.execute_sell_order(product_id, position, reason)
+                                        self.trade_executor.execute_sell_order(product_id, position, reason)
                                         continue
                                     
                                     # PROFIT TARGET REACHED BUT BUY SIGNAL - STAY IN POSITION
@@ -963,7 +863,7 @@ class TradingBot:
                                     elif profit_pct <= -2.0 and current_signal == 'SELL' and signal_confidence >= 0.6:
                                         reason = f"2% LOSS + STRONG SELL SIGNAL ({profit_pct:.2f}%, conf={signal_confidence:.1%})"
                                         logger.warning(f"[LOSS EXIT] {product_id}: {reason}")
-                                        self.execute_sell_order(product_id, position, reason)
+                                        self.trade_executor.execute_sell_order(product_id, position, reason)
                                         continue
                                     
                                     # LOSS WARNING BUT NOT SELLING
@@ -984,7 +884,7 @@ class TradingBot:
                                 
                                 if should_close:
                                     logger.info(f"[PAPER] Closing position {product_id}: {reason}")
-                                    self.execute_sell_order(product_id, position, reason)
+                                    self.trade_executor.execute_sell_order(product_id, position, reason)
                                 
                                 # Update trailing stop if enabled
                                 elif self.risk_manager.use_trailing_stop:
@@ -1004,7 +904,7 @@ class TradingBot:
                                 
                                 if should_close:
                                     logger.info(f"[PAPER] Closing position {product_id}: {reason}")
-                                    self.execute_sell_order(product_id, position, reason)
+                                    self.trade_executor.execute_sell_order(product_id, position, reason)
                         
                         # In live mode, signal-confirmed exits are handled here
                         # SL/TP exits are handled by _check_open_orders() for exchange orders
