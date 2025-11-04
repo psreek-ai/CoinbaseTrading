@@ -1,12 +1,13 @@
 
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 from typing import Dict
 
 from api_client import CoinbaseAPI
 from database import DatabaseManager
 from risk_management import RiskManager
+
 
 logger = logging.getLogger(__name__)
 
@@ -163,14 +164,23 @@ class TradeExecutor:
             logger.warning(f"Slippage too high: {slippage_percent:.2f}% > {max_slippage_percent}% - aborting trade")
             return
 
-        # Use preview's average price for more accurate entry
-        actual_entry_price = preview['average_filled_price']
+        # Use preview's average price if available, otherwise use our calculated entry price
+        actual_entry_price = preview.get('average_filled_price') or entry_price
         actual_size = preview['base_size']
+        
+        # Round size to product's base_increment to avoid precision errors
+        if product_details:
+            base_increment = product_details.get('base_increment', '0.00000001')
+            actual_size = float(Decimal(str(actual_size)).quantize(
+                Decimal(str(base_increment)), 
+                rounding=ROUND_DOWN
+            ))
+            logger.debug(f"Rounded size to base_increment {base_increment}: {actual_size}")
 
         # Execute order
         logger.info("=" * 60)
         logger.info(f"EXECUTING BUY ORDER: {product_id}")
-        logger.info(f"Size: {actual_size} | Entry: {actual_entry_price}")
+        logger.info(f"Size: {actual_size} | Entry: ${actual_entry_price}")
         logger.info(f"Fee: ${preview['commission_total']:.4f} ({fee_percent:.2f}%)")
         logger.info(f"Slippage: {slippage_percent:.2f}%")
         logger.info(f"Stop Loss: {stop_loss} | Take Profit: {take_profit}")
@@ -261,7 +271,11 @@ class TradeExecutor:
                 logger.error("Failed to place limit order")
                 return
 
-            order_id = limit_order['order_id']
+            order_id = limit_order.get('order_id')
+            if not order_id:
+                logger.error(f"Order placed but no order_id returned: {limit_order}")
+                return
+            
             logger.info(f"Limit order placed: {order_id}")
 
             # Save order to database with 'submitted' status

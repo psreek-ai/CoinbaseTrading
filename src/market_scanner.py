@@ -179,10 +179,13 @@ class MarketScanner:
             balances: Current account balances
         """
         crypto_holdings = []
+        min_holding_value = Decimal('10.0')  # Minimum $10 to match risk management settings
 
-        # Identify crypto assets (not USD/USDC)
+        # Identify crypto assets (not USD/USDC/DAI/stablecoins)
+        stablecoins = {'USD', 'USDC', 'DAI', 'USDT', 'BUSD', 'EURC', 'TUSD', 'PYUSD'}
+        
         for asset, balance in balances.items():
-            if asset not in ['USD', 'USDC'] and balance > 0:
+            if asset not in stablecoins and balance > 0:
                 # Get current price
                 price = self.api.get_latest_price(f"{asset}-USD")
                 if not price:
@@ -190,6 +193,12 @@ class MarketScanner:
 
                 if price:
                     usd_value = balance * price
+                    
+                    # Skip small holdings (less than $10)
+                    if usd_value < min_holding_value:
+                        logger.debug(f"Skipping small holding: {asset} (${usd_value:.4f})")
+                        continue
+                    
                     crypto_holdings.append({
                         'asset': asset,
                         'balance': balance,
@@ -198,8 +207,8 @@ class MarketScanner:
                     })
 
         if not crypto_holdings:
-            logger.info("No crypto holdings to analyze")
-            return
+            logger.info("No crypto holdings to analyze (excluding stablecoins and small positions)")
+            return {'sell': [], 'hold': []}
 
         logger.info(f"Analyzing {len(crypto_holdings)} current holdings in parallel...")
 
@@ -254,21 +263,24 @@ class MarketScanner:
 
                     # Log the signal
                     if result['signal'] == 'SELL' and result['confidence'] >= min_sell_confidence:
-                        logger.warning(f"[SELL] {result['asset']}: SELL signal (confidence: {result['confidence']:.2f}) - Value: ${result['usd_value']:.2f}")
+                        logger.warning(f"[SELL] {result['asset']}: SELL signal (confidence: {result['confidence']:.1%}) - Value: ${result['usd_value']:.2f}")
                         reasons = result['metadata'].get('reasons', [])
                         if reasons:
                             logger.warning(f"   Reasons: {', '.join(reasons)}")
                     elif result['signal'] == 'BUY':
-                        logger.info(f"[BUY/HOLD] {result['asset']}: BUY/HOLD signal (confidence: {result['confidence']:.2f}) - Value: ${result['usd_value']:.2f}")
+                        logger.info(f"[BUY/HOLD] {result['asset']}: BUY/HOLD signal (confidence: {result['confidence']:.1%}) - Value: ${result['usd_value']:.2f}")
                     else:
-                        logger.info(f"[HOLD] {result['asset']}: HOLD (no strong signal) - Value: ${result['usd_value']:.2f}")
+                        logger.info(f"[HOLD] {result['asset']}: HOLD signal (confidence: {result['confidence']:.1%}) - Value: ${result['usd_value']:.2f}")
 
-        # Summary and return SELL signals for potential conversion
+        # Summary and return SELL/HOLD signals for potential conversion
         should_sell = [h for h in holding_signals if h['signal'] == 'SELL' and h['confidence'] >= min_sell_confidence]
+        hold_signals = [h for h in holding_signals if h['signal'] not in ['SELL', 'BUY']]
 
         if should_sell:
             logger.warning(f"WARNING: {len(should_sell)} holdings have SELL signals:")
             for h in should_sell:
                 logger.warning(f"   - {h['asset']}: ${h['usd_value']:.2f} (confidence: {h['confidence']:.1%})")
 
-        return should_sell  # Return holdings with SELL signals for potential conversion
+        # Return both SELL and HOLD signals for potential conversion
+        # SELL signals will be converted first, HOLD signals can be converted if BUY is much stronger
+        return {'sell': should_sell, 'hold': hold_signals}

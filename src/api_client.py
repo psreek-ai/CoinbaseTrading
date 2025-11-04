@@ -6,7 +6,7 @@ import time
 import json
 import logging
 from datetime import datetime, timedelta, UTC
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, List, Optional
 from threading import Thread, Lock
 from pathlib import Path
@@ -655,7 +655,7 @@ class CoinbaseAPI:
         min_usd_equivalent: Decimal = Decimal('5')
     ) -> Dict[str, Decimal]:
         """
-        Get account balances with filtering.
+        Get account balances with filtering and pagination support.
         
         Args:
             portfolio_id: Portfolio UUID
@@ -665,39 +665,63 @@ class CoinbaseAPI:
             Dictionary of {asset: balance}
         """
         try:
-            # Apply rate limiting before API call
-            self._rate_limit()
-            
-            breakdown = self.rest_client.get_portfolio_breakdown(
-                portfolio_uuid=portfolio_id
-            )
-            
-            # Update rate limits from response headers
-            self._update_rate_limits(breakdown)
-            
-            # Log API response
-            self._log_api_call(
-                method='get_portfolio_breakdown',
-                endpoint=f'/portfolios/{portfolio_id}/breakdown',
-                params={'portfolio_uuid': portfolio_id},
-                response=breakdown
-            )
-            
             balances = {}
+            cursor = None
+            page_count = 0
             
-            if breakdown and breakdown.breakdown and breakdown.breakdown.spot_positions:
-                for asset in breakdown.breakdown.spot_positions:
-                    try:
-                        balance = Decimal(str(asset.total_balance_crypto))
-                        balance_usd = Decimal(str(getattr(asset, "total_balance_fiat", 0) or 0))
-                        
-                        if balance > Decimal('1e-8') and balance_usd >= min_usd_equivalent:
-                            balances[asset.asset] = balance
-                    except Exception as e:
-                        logger.debug(f"Error processing asset: {e}")
+            # Paginate through all portfolio breakdown pages
+            while True:
+                page_count += 1
+                
+                # Apply rate limiting before API call
+                self._rate_limit()
+                
+                # Get portfolio breakdown with pagination
+                if cursor:
+                    breakdown = self.rest_client.get_portfolio_breakdown(
+                        portfolio_uuid=portfolio_id,
+                        cursor=cursor
+                    )
+                else:
+                    breakdown = self.rest_client.get_portfolio_breakdown(
+                        portfolio_uuid=portfolio_id
+                    )
+                
+                # Update rate limits from response headers
+                self._update_rate_limits(breakdown)
+                
+                # Log API response
+                self._log_api_call(
+                    method='get_portfolio_breakdown',
+                    endpoint=f'/portfolios/{portfolio_id}/breakdown',
+                    params={'portfolio_uuid': portfolio_id, 'cursor': cursor},
+                    response=breakdown
+                )
+                
+                # Process balances from this page
+                if breakdown and breakdown.breakdown and breakdown.breakdown.spot_positions:
+                    for asset in breakdown.breakdown.spot_positions:
+                        try:
+                            balance = Decimal(str(asset.total_balance_crypto))
+                            balance_usd = Decimal(str(getattr(asset, "total_balance_fiat", 0) or 0))
+                            
+                            if balance > Decimal('1e-8') and balance_usd >= min_usd_equivalent:
+                                balances[asset.asset] = balance
+                        except Exception as e:
+                            logger.debug(f"Error processing asset: {e}")
+                            continue
+                
+                # Check if there are more pages
+                if hasattr(breakdown.breakdown, 'pagination') and breakdown.breakdown.pagination:
+                    cursor = getattr(breakdown.breakdown.pagination, 'next_cursor', None)
+                    if cursor:
+                        logger.debug(f"Fetching next page of balances (page {page_count + 1})...")
                         continue
+                
+                # No more pages
+                break
             
-            logger.info(f"Retrieved {len(balances)} balances (>= ${min_usd_equivalent})")
+            logger.info(f"Retrieved {len(balances)} balances (>= ${min_usd_equivalent}) from {page_count} page(s)")
             return balances
             
         except Exception as e:
@@ -791,17 +815,18 @@ class CoinbaseAPI:
                 # Update rate limits from response headers
                 self._update_rate_limits(product_info)
                 
-                # Log API call
-                self._log_api_call(
-                    method='get_product',
-                    endpoint=f'/products/{product_id}',
-                    params={'product_id': product_id},
-                    response=product_info
-                )
+                # Log API call - DISABLED for products to reduce log volume
+                # self._log_api_call(
+                #     method='get_product',
+                #     endpoint=f'/products/{product_id}',
+                #     params={'product_id': product_id},
+                #     response=product_info
+                # )
                 
                 # Extract minimum sizes with fallbacks
                 base_min_size = Decimal('0')
                 min_market_funds = Decimal('0')
+                base_increment = Decimal('0.00000001')  # Default for most products
                 
                 for attr in ['base_min_size', 'base_minimum_size', 'min_base_size']:
                     val = getattr(product_info, attr, None)
@@ -815,25 +840,32 @@ class CoinbaseAPI:
                         min_market_funds = Decimal(str(val))
                         break
                 
+                # Get base_increment for order size precision
+                increment_val = getattr(product_info, 'base_increment', None)
+                if increment_val:
+                    base_increment = Decimal(str(increment_val))
+                
                 details[product_id] = {
                     'base_min_size': base_min_size,
-                    'min_market_funds': min_market_funds
+                    'min_market_funds': min_market_funds,
+                    'base_increment': base_increment
                 }
                 
             except Exception as e:
                 logger.error(f"Error getting details for {product_id}: {e}")
                 
-                # Log API error
-                self._log_api_call(
-                    method='get_product',
-                    endpoint=f'/products/{product_id}',
-                    params={'product_id': product_id},
-                    error=e
-                )
+                # Log API error - DISABLED for products to reduce log volume
+                # self._log_api_call(
+                #     method='get_product',
+                #     endpoint=f'/products/{product_id}',
+                #     params={'product_id': product_id},
+                #     error=e
+                # )
                 
                 details[product_id] = {
                     'base_min_size': Decimal('0'),
-                    'min_market_funds': Decimal('0')
+                    'min_market_funds': Decimal('0'),
+                    'base_increment': Decimal('0.00000001')
                 }
         
         return details
@@ -891,19 +923,19 @@ class CoinbaseAPI:
             # Update rate limits from response headers
             self._update_rate_limits(candles_data)
             
-            # Log API response
-            self._log_api_call(
-                method='get_candles',
-                endpoint=f'/products/{product_id}/candles',
-                params={
-                    'product_id': product_id,
-                    'start': start_time.isoformat(),
-                    'end': end_time.isoformat(),
-                    'granularity': granularity,
-                    'requested_periods': periods
-                },
-                response=candles_data
-            )
+            # Log API response - DISABLED for candles to reduce log volume
+            # self._log_api_call(
+            #     method='get_candles',
+            #     endpoint=f'/products/{product_id}/candles',
+            #     params={
+            #         'product_id': product_id,
+            #         'start': start_time.isoformat(),
+            #         'end': end_time.isoformat(),
+            #         'granularity': granularity,
+            #         'requested_periods': periods
+            #     },
+            #     response=candles_data
+            # )
             
             if not hasattr(candles_data, 'candles') or not candles_data.candles:
                 logger.warning(f"No candle data for {product_id}")
@@ -936,16 +968,17 @@ class CoinbaseAPI:
             
         except Exception as e:
             logger.error(f"Error fetching historical data for {product_id}: {e}")
-            self._log_api_call(
-                method='get_candles',
-                endpoint=f'/products/{product_id}/candles',
-                params={
-                    'product_id': product_id,
-                    'granularity': granularity,
-                    'periods': periods
-                },
-                error=e
-            )
+            # Log API error - DISABLED for candles to reduce log volume
+            # self._log_api_call(
+            #     method='get_candles',
+            #     endpoint=f'/products/{product_id}/candles',
+            #     params={
+            #         'product_id': product_id,
+            #         'granularity': granularity,
+            #         'periods': periods
+            #     },
+            #     error=e
+            # )
             raise APIError(f"Failed to fetch historical data for {product_id}: {e}") from e
     
     def get_latest_price(self, product_id: str) -> Optional[Decimal]:
@@ -1298,6 +1331,136 @@ class CoinbaseAPI:
             
             raise OrderError(f"Failed to create stop-limit order: {e}") from e
     
+    def place_market_order(
+        self,
+        product_id: str,
+        side: str,
+        size: float
+    ) -> Optional[Dict]:
+        """
+        Place a market order.
+        
+        Args:
+            product_id: Product to trade
+            side: BUY or SELL
+            size: Order size in base currency
+            
+        Returns:
+            Order details if successful
+        """
+        try:
+            # Apply rate limiting before API call
+            self._rate_limit()
+            
+            # Get product details to determine proper precision
+            try:
+                product_details = self.get_product_details([product_id])
+                if product_id in product_details:
+                    base_increment = product_details[product_id].get('base_increment', Decimal('0.00000001'))
+                    # Round size to match base_increment precision
+                    size_decimal = Decimal(str(size))
+                    # Quantize to the proper precision
+                    rounded_size = size_decimal.quantize(base_increment, rounding=ROUND_DOWN)
+                    size = float(rounded_size)
+                    logger.info(f"Rounded order size from {size_decimal} to {rounded_size} (increment: {base_increment})")
+            except Exception as details_error:
+                logger.warning(f"Could not get product details for {product_id}, using size as-is: {details_error}")
+            
+            try:
+                # Use quote_size for BUY (spending USDC), base_size for SELL (selling crypto)
+                response = self.rest_client.market_order(
+                    client_order_id=f"market_{datetime.now(UTC).timestamp()}",
+                    product_id=product_id,
+                    side=side,
+                    quote_size=str(size) if side == "BUY" else None,
+                    base_size=str(size) if side == "SELL" else None
+                )
+                
+                # Update rate limits
+                self._update_rate_limits(response)
+                
+                # Log API call
+                self._log_api_call(
+                    method='market_order',
+                    endpoint='/orders',
+                    params={
+                        'product_id': product_id,
+                        'side': side,
+                        'size': str(size)
+                    },
+                    response=response
+                )
+            except Exception as order_error:
+                # Log the failed API call
+                self._log_api_call(
+                    method='market_order',
+                    endpoint='/orders',
+                    params={
+                        'product_id': product_id,
+                        'side': side,
+                        'size': str(size)
+                    },
+                    error=order_error
+                )
+                raise
+            
+            if not response:
+                raise OrderError(f"No response from market order for {product_id}")
+            
+            # Check if order was successful
+            if not response.success:
+                error_msg = f"Market order failed for {product_id}"
+                if hasattr(response, 'error_response') and response.error_response:
+                    if hasattr(response.error_response, 'error'):
+                        error_msg += f": {response.error_response.error} - {response.error_response.message}"
+                    else:
+                        error_msg += f": {response.error_response}"
+                elif hasattr(response, 'failure_reason') and response.failure_reason:
+                    error_msg += f": {response.failure_reason}"
+                logger.error(f"[DEBUG] Response type: {type(response)}")
+                logger.error(f"[DEBUG] Response details: {response}")
+                if hasattr(response, '__dict__'):
+                    logger.error(f"[DEBUG] Response dict: {response.__dict__}")
+                raise OrderError(error_msg)
+            
+            # Extract order ID safely
+            order_id = None
+            if hasattr(response, 'success_response') and response.success_response:
+                if hasattr(response.success_response, 'order_id'):
+                    order_id = response.success_response.order_id
+                elif isinstance(response.success_response, dict):
+                    order_id = response.success_response.get('order_id')
+            
+            order = {
+                'success': response.success,
+                'order_id': order_id,
+                'product_id': product_id,
+                'side': side,
+                'type': 'market',
+                'size': size
+            }
+            
+            logger.info(f"Market order placed: {side} {size} {product_id} - Order ID: {order_id}")
+            
+            return order
+            
+        except Exception as e:
+            logger.error(f"Error placing market order: {e}")
+            
+            # Log API error
+            self._log_api_call(
+                method='market_order',
+                endpoint='/orders',
+                params={
+                    'product_id': product_id,
+                    'side': side,
+                    'size': str(size)
+                },
+                error=e
+            )
+            
+            raise OrderError(f"Failed to place market order: {e}") from e
+    
     def create_bracket_order(
         self,
         product_id: str,
@@ -1459,21 +1622,74 @@ class CoinbaseAPI:
             }
         """
         try:
-            # Get account IDs for source and target currencies
+            # Get account IDs for source and target currencies (with pagination)
             logger.info(f"Getting account IDs for {from_asset} and {to_asset}")
-            
-            accounts_response = self.rest_client.get_accounts()
-            self._update_rate_limits(accounts_response)
             
             from_account_id = None
             to_account_id = None
+            all_accounts = []
+            cursor = None
+            page_num = 1
             
-            if hasattr(accounts_response, 'accounts'):
-                for account in accounts_response.accounts:
-                    if account.currency == from_asset:
+            # Fetch all pages of accounts
+            while True:
+                if cursor:
+                    accounts_response = self.rest_client.get_accounts(cursor=cursor)
+                else:
+                    accounts_response = self.rest_client.get_accounts()
+                
+                self._update_rate_limits(accounts_response)
+                
+                if hasattr(accounts_response, 'accounts'):
+                    all_accounts.extend(accounts_response.accounts)
+                    logger.info(f"[DEBUG] Page {page_num}: Retrieved {len(accounts_response.accounts)} accounts")
+                    page_num += 1
+                    
+                    # Check if there are more pages
+                    if hasattr(accounts_response, 'has_next') and accounts_response.has_next:
+                        cursor = accounts_response.cursor
+                    else:
+                        break
+                else:
+                    logger.error(f"[DEBUG] accounts_response has no 'accounts' attribute")
+                    logger.error(f"[DEBUG] accounts_response type: {type(accounts_response)}")
+                    logger.error(f"[DEBUG] accounts_response: {accounts_response}")
+                    break
+            
+            # Now search through all accounts
+            logger.info(f"[DEBUG] Total accounts retrieved: {len(all_accounts)}")
+            for account in all_accounts:
+                logger.debug(f"  Account: currency={account.currency}, uuid={account.uuid}, available_balance={getattr(account, 'available_balance', 'N/A')}")
+                
+                account_currency = account.currency
+                
+                # Match exact currency first (prioritize over ETH2 mapping)
+                if account_currency == from_asset and not from_account_id:
+                    from_account_id = account.uuid
+                    logger.info(f"  -> Matched {from_asset} account: {account.uuid}")
+                elif account_currency == to_asset and not to_account_id:
+                    to_account_id = account.uuid
+                    logger.info(f"  -> Matched {to_asset} account: {account.uuid}")
+            
+            # If still not found, try ETH/ETH2 mapping as fallback
+            if from_asset == 'ETH' and not from_account_id:
+                for account in all_accounts:
+                    if account.currency == 'ETH2':
                         from_account_id = account.uuid
-                    if account.currency == to_asset:
+                        logger.info(f"  -> Fallback: Matched {from_asset} to ETH2 account")
+                        break
+            
+            if to_asset == 'ETH' and not to_account_id:
+                for account in all_accounts:
+                    if account.currency == 'ETH2':
                         to_account_id = account.uuid
+                        logger.info(f"  -> Fallback: Matched {to_asset} to ETH2 account")
+                        break
+            
+            if not from_account_id or not to_account_id:
+                # Log all account currencies for debugging
+                all_currencies = [acc.currency for acc in all_accounts]
+                logger.error(f"[DEBUG] All available currencies: {sorted(set(all_currencies))}")
             
             if not from_account_id:
                 raise APIError(f"Could not find account ID for {from_asset}")
@@ -1487,26 +1703,51 @@ class CoinbaseAPI:
             # Step 1: Create a convert quote
             logger.info(f"Creating convert quote: {amount} {from_asset} -> {to_asset}")
             
-            quote_response = self.rest_client.create_convert_quote(
-                from_account=from_account_id,
-                to_account=to_account_id,
-                amount=amount
-            )
+            try:
+                quote_response = self.rest_client.create_convert_quote(
+                    from_account=from_account_id,
+                    to_account=to_account_id,
+                    amount=amount
+                )
+                
+                # Update rate limits
+                self._update_rate_limits(quote_response)
+                
+                # Log API call with UUIDs
+                self._log_api_call(
+                    method='create_convert_quote',
+                    endpoint='/convert/quote',
+                    params={
+                        'from_account_id': from_account_id,
+                        'from_currency': from_asset,
+                        'to_account_id': to_account_id,
+                        'to_currency': to_asset,
+                        'amount': amount
+                    },
+                    response=quote_response
+                )
+            except Exception as quote_error:
+                # Log the failed API call with UUIDs
+                self._log_api_call(
+                    method='create_convert_quote',
+                    endpoint='/convert/quote',
+                    params={
+                        'from_account_id': from_account_id,
+                        'from_currency': from_asset,
+                        'to_account_id': to_account_id,
+                        'to_currency': to_asset,
+                        'amount': amount
+                    },
+                    error=quote_error
+                )
+                raise
             
-            # Update rate limits
-            self._update_rate_limits(quote_response)
-            
-            # Log API call
-            self._log_api_call(
-                method='create_convert_quote',
-                endpoint='/convert/quote',
-                params={
-                    'from_account': from_asset,
-                    'to_account': to_asset,
-                    'amount': amount
-                },
-                response=quote_response
-            )
+            # Log HTTP response details
+            logger.info(f"[HTTP RESPONSE] create_convert_quote:")
+            logger.info(f"  Response type: {type(quote_response)}")
+            logger.info(f"  Response object: {quote_response}")
+            if hasattr(quote_response, '__dict__'):
+                logger.info(f"  Response attributes: {quote_response.__dict__}")
             
             # Debug: Log the full response structure
             logger.info(f"[DEBUG] Convert quote response type: {type(quote_response)}")
@@ -1542,6 +1783,13 @@ class CoinbaseAPI:
                 from_account=from_account_id,
                 to_account=to_account_id
             )
+            
+            # Log HTTP response details
+            logger.info(f"[HTTP RESPONSE] commit_convert_trade:")
+            logger.info(f"  Response type: {type(commit_response)}")
+            logger.info(f"  Response object: {commit_response}")
+            if hasattr(commit_response, '__dict__'):
+                logger.info(f"  Response attributes: {commit_response.__dict__}")
             
             # Update rate limits
             self._update_rate_limits(commit_response)
@@ -1775,15 +2023,25 @@ class CoinbaseAPI:
             if not response:
                 raise OrderError(f"No response from limit order for {product_id}")
             
+            # Extract order ID safely from response
+            order_id = None
+            if hasattr(response, 'success_response') and response.success_response:
+                if hasattr(response.success_response, 'order_id'):
+                    order_id = response.success_response.order_id
+                elif isinstance(response.success_response, dict):
+                    order_id = response.success_response.get('order_id')
+            elif hasattr(response, 'order_id'):
+                order_id = response.order_id
+            
             order = {
-                'order_id': getattr(response, 'order_id', None),
+                'order_id': order_id,
                 'product_id': product_id,
                 'side': side,
                 'type': 'limit_gtc',
                 'price': price,
                 'size': size,
                 'post_only': post_only,
-                'status': getattr(response, 'status', None)
+                'status': getattr(response, 'status', 'submitted')
             }
             
             rebate_note = " (earning maker rebates)" if post_only else ""

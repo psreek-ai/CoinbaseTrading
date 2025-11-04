@@ -33,13 +33,16 @@ trading:
 # Risk Management
 risk_management:
   # Maximum percentage of total portfolio to risk on a single trade
-  risk_percent_per_trade: 0.01  # 1%
+  risk_percent_per_trade: 0.05  # 5% (increased for small accounts)
   
   # Maximum percentage of portfolio to allocate to any single position
-  max_position_size_percent: 0.10  # 10%
+  max_position_size_percent: 0.20  # 20% (increased for small accounts)
   
   # Maximum total exposure (sum of all positions as % of portfolio)
   max_total_exposure_percent: 0.50  # 50%
+  
+  # Minimum USD value per trade (keep at $10 to ensure positions are large enough to monitor)
+  min_usd_trade_value: 10.0  # $10
   
   # Default stop loss percentage below entry
   default_stop_loss_percent: 0.015  # 1.5%
@@ -54,17 +57,14 @@ risk_management:
   # Maximum allowed drawdown before stopping trading
   max_drawdown_percent: 0.15  # 15%
   
-  # Minimum USD equivalent value to consider for trading
-  min_usd_trade_value: 10.0
-  
   # Maximum number of concurrent positions
   max_concurrent_positions: 5
   
   # Maximum fee percentage allowed per trade (as % of position value)
-  max_fee_percent: 1.0  # 1%
+  max_fee_percent: 0.01  # 1%
   
   # Maximum slippage percentage allowed per trade
-  max_slippage_percent: 0.5  # 0.5%
+  max_slippage_percent: 0.005  # 0.5%
 
 # Strategy Selection and Parameters
 strategies:
@@ -195,6 +195,6 @@ logging:
   backup_count: 10
   
   # API Response Logging (for debugging)
-  log_api_responses: false  # Log raw API responses to separate file
+  log_api_responses: true  # Log raw API responses to separate file
   api_log_file: "logs/api_responses.log"  # Separate file for API calls
   log_api_errors_only: false  # If true, only log failed API calls
