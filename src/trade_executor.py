@@ -75,9 +75,13 @@ class TradeExecutor:
                 logger.warning(f"Spread too wide ({spread_pct:.2f}% > {max_spread_pct}%), skipping entry")
                 return
 
-            # Place limit order slightly better than best ask (try to earn maker rebate)
-            tick_size = Decimal('0.01')  # Adjust based on product
-            entry_price = best_ask - tick_size if best_ask else self.api.get_latest_price(product_id)
+            # Use product's price increment for tick size
+            product_info = product_details.get(product_id, {})
+            price_increment = Decimal(str(product_info.get('price_increment', '0.01')))
+            
+            # Place limit order AT best ask to ensure fill (still uses post-only for maker rebate if possible)
+            # If we want to be more aggressive, we could do: best_ask + price_increment
+            entry_price = best_ask
 
             logger.info(f"Spread analysis: Best Ask=${best_ask}, Spread={spread_pct:.3f}%, Entry=${entry_price}")
         else:
@@ -137,12 +141,16 @@ class TradeExecutor:
             logger.warning(f"Cannot open position: {reason}")
             return
 
+        # Round position_value to quote_increment for preview (avoid INVALID_QUOTE_SIZE_PRECISION)
+        quote_increment = product_info.get('quote_increment', Decimal('0.01'))
+        position_value_rounded = (position_value / quote_increment).quantize(Decimal('1'), rounding=ROUND_DOWN) * quote_increment
+        
         # Preview the order first
         logger.info(f"Previewing order for {product_id}...")
         preview = self.api.preview_order(
             product_id=product_id,
             side='BUY',
-            size=position_size
+            size=position_value_rounded  # For BUY, pass rounded USD value (quote_size)
         )
 
         if not preview:
@@ -153,15 +161,17 @@ class TradeExecutor:
         max_fee_percent = self.risk_manager.max_fee_percent
         max_slippage_percent = self.risk_manager.max_slippage_percent
 
-        fee_percent = (preview['commission_total'] / position_value) * Decimal('100')
+        # Use quote_size from preview as the actual order value (not position_value which is estimated)
+        actual_order_value = preview['quote_size'] if preview['quote_size'] > 0 else position_value
+        fee_percent = preview['commission_total'] / actual_order_value  # Keep as decimal for comparison
         slippage_percent = preview['slippage']
 
         if fee_percent > max_fee_percent:
-            logger.warning(f"Fee too high: {fee_percent:.2f}% > {max_fee_percent}% - aborting trade")
+            logger.warning(f"Fee too high: {fee_percent*100:.2f}% > {max_fee_percent*100:.2f}% - aborting trade")
             return
 
         if slippage_percent > max_slippage_percent:
-            logger.warning(f"Slippage too high: {slippage_percent:.2f}% > {max_slippage_percent}% - aborting trade")
+            logger.warning(f"Slippage too high: {slippage_percent*100:.2f}% > {max_slippage_percent*100:.2f}% - aborting trade")
             return
 
         # Use preview's average price if available, otherwise use our calculated entry price
@@ -297,20 +307,45 @@ class TradeExecutor:
                 }
             })
 
-            # Monitor order for fill (wait up to 30 seconds)
-            logger.info(f"Monitoring limit order {order_id} for fill...")
+            # Start WebSocket with user channel for real-time order updates
+            logger.info(f"Starting WebSocket user channel for order monitoring...")
+            try:
+                # Start WebSocket with user channel enabled
+                self.api.start_websocket([product_id], enable_user_channel=True)
+                logger.info(f"WebSocket user channel started for {product_id}")
+            except Exception as e:
+                logger.warning(f"Could not start WebSocket for order monitoring: {e}")
+                logger.info("Falling back to REST API polling")
+
+            # Monitor order for fill (wait up to configured timeout)
+            timeout = self.risk_manager.order_fill_timeout
+            logger.info(f"Monitoring limit order {order_id} for fill (timeout: {timeout}s)...")
             import time
             filled = False
-            for i in range(30):
-                time.sleep(1)
-                order_status = self.api.get_order_status(order_id)
-                if order_status and order_status['status'] in ['FILLED', 'CANCELLED', 'EXPIRED']:
-                    filled = order_status['status'] == 'FILLED'
-                    logger.info(f"Order {order_id} status: {order_status['status']}")
-                    break
+            start_time = time.time()
+            
+            while time.time() - start_time < timeout:
+                # First check WebSocket for real-time updates
+                ws_update = self.api.get_order_update(order_id)
+                if ws_update:
+                    status = ws_update.get('status')
+                    if status in ['FILLED', 'CANCELLED', 'EXPIRED']:
+                        filled = status == 'FILLED'
+                        logger.info(f"Order {order_id} status from WebSocket: {status}")
+                        break
+                
+                # Fallback: Poll REST API every 5 seconds (reduced from every 1 second)
+                if int(time.time() - start_time) % 5 == 0:
+                    order_status = self.api.get_order_status(order_id)
+                    if order_status and order_status['status'] in ['FILLED', 'CANCELLED', 'EXPIRED']:
+                        filled = order_status['status'] == 'FILLED'
+                        logger.info(f"Order {order_id} status from REST: {order_status['status']}")
+                        break
+                
+                time.sleep(0.5)  # Check WebSocket twice per second
 
             if not filled:
-                logger.warning(f"Limit order {order_id} not filled within 30s - cancelling to prevent ghost order")
+                logger.warning(f"Limit order {order_id} not filled within {timeout}s - cancelling to prevent ghost order")
 
                 # CRITICAL: Cancel the order to prevent it from becoming a ghost order
                 try:

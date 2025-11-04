@@ -85,7 +85,9 @@ class TradingBot:
         log_dir = Path(self.config.get('logging.log_directory', 'logs'))
         log_dir.mkdir(exist_ok=True)
         
-        log_file = log_dir / f"trading_bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        # Use same timestamp for all log files in this session
+        self.log_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = log_dir / f"trading_bot_{self.log_timestamp}.log"
         
         # Configure root logger
         logging.basicConfig(
@@ -114,9 +116,11 @@ class TradingBot:
         
         # Enable API response logging if configured
         if self.config.get('logging.log_api_responses', False):
-            log_file = self.config.get('logging.api_log_file', 'logs/api_responses.log')
+            # Use same timestamp as main log file
+            log_dir = Path(self.config.get('logging.log_directory', 'logs'))
+            log_file = log_dir / f"api_responses_{self.log_timestamp}.log"
             errors_only = self.config.get('logging.log_api_errors_only', False)
-            api.enable_api_logging(log_file=log_file, errors_only=errors_only)
+            api.enable_api_logging(log_file=str(log_file), errors_only=errors_only)
         
         # Check API permissions
         permissions = api.check_api_permissions()
@@ -742,7 +746,6 @@ class TradingBot:
                             
                             position_metadata = position.get('metadata', {})
                             if isinstance(position_metadata, str):
-                                import json
                                 position_metadata = json.loads(position_metadata)
                             
                             exit_reason = 'unknown_exit'
@@ -954,19 +957,15 @@ class TradingBot:
                 best_opportunities = []
                 
                 try:
-                    # Get ALL balances (no minimum filter) for holdings analysis
-                    # This ensures we analyze all holdings including small ones for auto-conversion
+                    # Get ALL balances (low threshold to capture everything)
+                    # analyze_current_holdings will filter to $10+ minimum
                     all_balances = self.api.get_account_balances(
                         self.portfolio_id,
-                        min_usd_equivalent=Decimal('0.01')  # Very low threshold to get all holdings
+                        min_usd_equivalent=Decimal('0.01')
                     )
                     
-                    # DEBUG: Log all balances retrieved
-                    logger.info(f"DEBUG: all_balances = {all_balances}")
-                    for asset, balance in all_balances.items():
-                        logger.info(f"  - {asset}: {balance}")
-                    
-                    # First, analyze current holdings and get SELL/HOLD signals
+                    # Analyze current holdings and get SELL/HOLD signals
+                    # (automatically filters to $10+ positions)
                     holding_signals = self.market_scanner.analyze_current_holdings(all_balances, self._shutdown_event)
                     
                     # Then scan all products for new opportunities

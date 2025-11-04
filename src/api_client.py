@@ -101,8 +101,8 @@ class CoinbaseAPI:
             handler = logging.FileHandler(log_file)
             handler.setLevel(logging.DEBUG)
             formatter = logging.Formatter(
-                '%(asctime)s - %(levelname)s - %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
+                '%(asctime)s - %(levelname)s - %(message)s'
+                # No datefmt specified - uses default format with milliseconds
             )
             handler.setFormatter(formatter)
             api_response_logger.addHandler(handler)

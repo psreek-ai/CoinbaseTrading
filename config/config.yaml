@@ -61,10 +61,13 @@ risk_management:
   max_concurrent_positions: 5
   
   # Maximum fee percentage allowed per trade (as % of position value)
-  max_fee_percent: 0.01  # 1%
+  max_fee_percent: 0.02  # 2% (allows for taker fees ~0.6%)
   
   # Maximum slippage percentage allowed per trade
-  max_slippage_percent: 0.005  # 0.5%
+  max_slippage_percent: 0.01  # 1%
+  
+  # Order fill timeout (seconds to wait for limit order to fill before cancelling)
+  order_fill_timeout: 300  # 5 minutes (was 30s - increased for better fill rates)
 
 # Strategy Selection and Parameters
 strategies:

@@ -62,12 +62,20 @@ class MarketScanner:
 
             def analyze_product_quick(product_id):
                 """Quick product analysis for scanning."""
+                # Check shutdown event before processing
+                if shutdown_event.is_set():
+                    return None
+                    
                 try:
                     # Get historical data
                     df = self.api.get_historical_data(product_id, granularity, periods)
 
                     if df.empty or len(df) < 50:
                         logger.debug(f"[SCAN] {product_id:15s} - Insufficient data (< 50 candles)")
+                        return None
+
+                    # Check shutdown event before heavy computation
+                    if shutdown_event.is_set():
                         return None
 
                     # Add indicators first so we can display them
@@ -138,7 +146,10 @@ class MarketScanner:
 
                 for future in as_completed(futures):
                     if shutdown_event.is_set():
-                        logger.info("Shutdown requested, stopping scan...")
+                        logger.info("Shutdown requested during scan - cancelling remaining tasks...")
+                        # Cancel all pending futures
+                        for f in futures:
+                            f.cancel()
                         break
 
                     completed += 1
@@ -218,6 +229,10 @@ class MarketScanner:
 
         def analyze_holding(holding):
             """Analyze a single holding."""
+            # Check shutdown event before processing
+            if shutdown_event.is_set():
+                return None
+                
             asset = holding['asset']
             product_id = f"{asset}-USD"
 
@@ -226,6 +241,10 @@ class MarketScanner:
 
                 if df.empty or len(df) < 50:
                     logger.debug(f"Insufficient data for {product_id}")
+                    return None
+                
+                # Check shutdown event before heavy computation
+                if shutdown_event.is_set():
                     return None
 
                 signal = self.strategy.analyze(df, product_id)
@@ -254,7 +273,10 @@ class MarketScanner:
 
             for future in as_completed(futures):
                 if shutdown_event.is_set():
-                    logger.info("Shutdown requested, stopping holdings analysis...")
+                    logger.info("Shutdown requested during holdings analysis - cancelling remaining tasks...")
+                    # Cancel all pending futures
+                    for f in futures:
+                        f.cancel()
                     break
 
                 result = future.result()
