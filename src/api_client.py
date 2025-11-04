@@ -15,6 +15,16 @@ import pandas as pd
 from coinbase.rest import RESTClient
 from coinbase.websocket import WSClient
 
+from exceptions import (
+    APIError,
+    PortfolioError,
+    OrderError,
+    RateLimitError,
+    AuthenticationError,
+    InvalidRequestError,
+    APINetworkError
+)
+
 logger = logging.getLogger(__name__)
 
 # Create a separate logger for API responses
@@ -534,8 +544,7 @@ class CoinbaseAPI:
                 logger.info(f"Retrieved portfolio ID: {portfolio_id}")
                 return portfolio_id
             else:
-                logger.error("No portfolios found")
-                return None
+                raise PortfolioError("No portfolios found for this API key.")
         except Exception as e:
             logger.error(f"Error getting portfolio ID: {e}")
             
@@ -547,7 +556,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return None
+            raise APIError(f"Failed to get portfolio ID: {e}") from e
     
     def get_all_portfolios(self) -> List[Dict]:
         """
@@ -594,7 +603,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return []
+            raise APIError(f"Failed to get portfolios: {e}") from e
     
     def create_portfolio(self, name: str) -> Optional[str]:
         """
@@ -625,8 +634,7 @@ class CoinbaseAPI:
                 logger.info(f"Created portfolio: {name} ({portfolio_id})")
                 return portfolio_id
             
-            logger.error(f"Failed to create portfolio: {name}")
-            return None
+            raise PortfolioError(f"Failed to create portfolio: {name}")
             
         except Exception as e:
             logger.error(f"Error creating portfolio: {e}")
@@ -639,7 +647,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return None
+            raise PortfolioError(f"Failed to create portfolio '{name}': {e}") from e
     
     def get_account_balances(
         self,
@@ -700,7 +708,7 @@ class CoinbaseAPI:
                 params={'portfolio_uuid': portfolio_id},
                 error=e
             )
-            return {}
+            raise APIError(f"Failed to get account balances: {e}") from e
     
     def find_tradable_products(
         self,
@@ -759,7 +767,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return []
+            raise APIError(f"Failed to find tradable products: {e}") from e
     
     def get_product_details(self, product_ids: List[str]) -> Dict[str, Dict]:
         """
@@ -938,7 +946,7 @@ class CoinbaseAPI:
                 },
                 error=e
             )
-            return pd.DataFrame()
+            raise APIError(f"Failed to fetch historical data for {product_id}: {e}") from e
     
     def get_latest_price(self, product_id: str) -> Optional[Decimal]:
         """
@@ -1067,7 +1075,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return None
+            raise OrderError(f"Failed to preview order: {e}") from e
     
     def get_transaction_summary(
         self,
@@ -1115,7 +1123,7 @@ class CoinbaseAPI:
             )
             
             if not response:
-                return None
+                raise APIError("No response received for transaction summary.")
             
             summary = {
                 'total_volume': Decimal(str(getattr(response, 'total_volume', 0))),
@@ -1149,7 +1157,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return None
+            raise APIError(f"Failed to get transaction summary: {e}") from e
     
     def check_api_permissions(self) -> Dict[str, bool]:
         """
@@ -1201,7 +1209,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return {}
+            raise APIError(f"Failed to check API permissions: {e}") from e
     
     def create_stop_limit_order(
         self,
@@ -1253,8 +1261,7 @@ class CoinbaseAPI:
             )
             
             if not response:
-                logger.error(f"No response from stop-limit order for {product_id}")
-                return None
+                raise OrderError(f"No response from stop-limit order for {product_id}")
             
             order = {
                 'order_id': getattr(response, 'order_id', None),
@@ -1289,7 +1296,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return None
+            raise OrderError(f"Failed to create stop-limit order: {e}") from e
     
     def create_bracket_order(
         self,
@@ -1344,8 +1351,7 @@ class CoinbaseAPI:
             )
             
             if not response:
-                logger.error(f"No response from bracket order for {product_id}")
-                return None
+                raise OrderError(f"No response from bracket order for {product_id}")
             
             order = {
                 'order_id': getattr(response, 'order_id', None),
@@ -1382,7 +1388,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return None
+            raise OrderError(f"Failed to create bracket order: {e}") from e
     
     def cancel_order(self, order_id: str) -> bool:
         """
@@ -1428,7 +1434,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return False
+            raise OrderError(f"Failed to cancel order {order_id}: {e}") from e
     
     def convert_crypto(self, from_asset: str, to_asset: str, amount: str) -> Optional[Dict]:
         """
@@ -1470,12 +1476,10 @@ class CoinbaseAPI:
                         to_account_id = account.uuid
             
             if not from_account_id:
-                logger.error(f"Could not find account ID for {from_asset}")
-                return None
+                raise APIError(f"Could not find account ID for {from_asset}")
             
             if not to_account_id:
-                logger.error(f"Could not find account ID for {to_asset}")
-                return None
+                raise APIError(f"Could not find account ID for {to_asset}")
             
             logger.info(f"From account: {from_account_id} ({from_asset})")
             logger.info(f"To account: {to_account_id} ({to_asset})")
@@ -1516,8 +1520,7 @@ class CoinbaseAPI:
                     logger.info(f"[DEBUG] Trade attributes: {trade_attrs}")
             
             if not hasattr(quote_response, 'trade') or not quote_response.trade:
-                logger.error("Failed to get conversion quote - no trade in response")
-                return None
+                raise APIError("Failed to get conversion quote - no trade in response")
             
             trade = quote_response.trade
             trade_id = trade.id
@@ -1556,8 +1559,7 @@ class CoinbaseAPI:
             )
             
             if not hasattr(commit_response, 'trade') or not commit_response.trade:
-                logger.error("Failed to commit conversion - no trade in response")
-                return None
+                raise APIError("Failed to commit conversion - no trade in response")
             
             committed_trade = commit_response.trade
             status = getattr(committed_trade, 'status', 'unknown')
@@ -1589,7 +1591,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return None
+            raise APIError(f"Failed to convert {from_asset} to {to_asset}: {e}") from e
     
     def get_order_status(self, order_id: str) -> Optional[Dict]:
         """
@@ -1641,7 +1643,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return None
+            raise OrderError(f"Failed to get order status for {order_id}: {e}") from e
     
     def get_best_bid_ask(self, product_ids: List[str]) -> Dict:
         """
@@ -1672,8 +1674,7 @@ class CoinbaseAPI:
             )
             
             if not response or not hasattr(response, 'pricebooks'):
-                logger.warning("No pricebooks in best bid/ask response")
-                return {}
+                raise APIError("No pricebooks in best bid/ask response")
             
             result = {}
             for pricebook in response.pricebooks:
@@ -1717,7 +1718,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return {}
+            raise APIError(f"Failed to get best bid/ask: {e}") from e
     
     def place_limit_order_gtc(
         self,
@@ -1772,8 +1773,7 @@ class CoinbaseAPI:
             )
             
             if not response:
-                logger.error(f"No response from limit order for {product_id}")
-                return None
+                raise OrderError(f"No response from limit order for {product_id}")
             
             order = {
                 'order_id': getattr(response, 'order_id', None),
@@ -1804,7 +1804,7 @@ class CoinbaseAPI:
                 },
                 error=e
             )
-            return None
+            raise OrderError(f"Failed to place limit order: {e}") from e
     
     def get_fills(
         self,
@@ -1891,7 +1891,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return []
+            raise APIError(f"Failed to get fills: {e}") from e
     
     def get_market_trades(
         self,
@@ -1957,7 +1957,7 @@ class CoinbaseAPI:
                 error=e
             )
             
-            return []
+            raise APIError(f"Failed to get market trades for {product_id}: {e}") from e
     
     def analyze_volume_flow(
         self,

@@ -1,8 +1,3 @@
-"""
-Advanced risk management system.
-Handles position sizing, portfolio-level risk, drawdown protection.
-"""
-
 from decimal import Decimal, getcontext, ROUND_DOWN
 from typing import Dict, Optional, Tuple
 import logging
@@ -29,16 +24,16 @@ class RiskManager:
         self.db = db_manager
         
         # Risk parameters
-        self.risk_percent_per_trade = Decimal(str(config.get('risk_percent_per_trade', 0.01)))
-        self.max_position_size_percent = Decimal(str(config.get('max_position_size_percent', 0.10)))
-        self.max_total_exposure_percent = Decimal(str(config.get('max_total_exposure_percent', 0.50)))
-        self.default_stop_loss_percent = Decimal(str(config.get('default_stop_loss_percent', 0.015)))
-        self.default_take_profit_percent = Decimal(str(config.get('default_take_profit_percent', 0.03)))
+        self.risk_percent_per_trade = Decimal(str(config.get('risk_percent_per_trade', '0.01')))
+        self.max_position_size_percent = Decimal(str(config.get('max_position_size_percent', '0.10')))
+        self.max_total_exposure_percent = Decimal(str(config.get('max_total_exposure_percent', '0.50')))
+        self.default_stop_loss_percent = Decimal(str(config.get('default_stop_loss_percent', '0.015')))
+        self.default_take_profit_percent = Decimal(str(config.get('default_take_profit_percent', '0.03')))
         self.use_trailing_stop = config.get('use_trailing_stop', False)
-        self.trailing_stop_percent = Decimal(str(config.get('trailing_stop_percent', 0.02)))
-        self.max_drawdown_percent = Decimal(str(config.get('max_drawdown_percent', 0.15)))
-        self.min_usd_trade_value = Decimal(str(config.get('min_usd_trade_value', 10.0)))
-        self.max_concurrent_positions = config.get('max_concurrent_positions', 5)
+        self.trailing_stop_percent = Decimal(str(config.get('trailing_stop_percent', '0.02')))
+        self.max_drawdown_percent = Decimal(str(config.get('max_drawdown_percent', '0.15')))
+        self.min_usd_trade_value = Decimal(str(config.get('min_usd_trade_value', '10.0')))
+        self.max_concurrent_positions = int(config.get('max_concurrent_positions', 5))
         
         # Track peak equity for drawdown calculation
         self.peak_equity = Decimal('0')

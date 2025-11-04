@@ -82,6 +82,16 @@ strategies:
     bb_period: 20
     bb_std: 2.0
     volume_threshold: 1.5  # Volume must be 1.5x average
+    adx_length: 14
+    ema_fast_length: 20
+    ema_slow_length: 50
+    volume_ma_length: 20
+    adx_threshold: 15
+    volume_confirmation_multiplier: 2.5
+    price_proximity_threshold: 0.015
+    rsi_momentum_buy_lower_bound: 50
+    rsi_momentum_buy_upper_bound: 75
+    rsi_momentum_sell_upper_bound: 40
   
   # Mean Reversion Strategy Parameters
   mean_reversion:
@@ -91,14 +101,28 @@ strategies:
     rsi_extreme_oversold: 20
     rsi_extreme_overbought: 80
     mean_lookback: 50
+    stoch_length: 14
+    ema_long_length: 200
+    distance_from_mean_threshold: -5
   
   # Breakout Strategy Parameters
   breakout:
-    lookback_period: 20
+    lookback_period: 50
     volume_confirmation: true
-    volume_threshold: 2.0
+    volume_threshold: 3.0
     atr_period: 14
     atr_multiplier: 1.5
+    adx_length: 14
+    bb_period: 20
+    bb_std: 2.0
+    volume_ma_short_length: 3
+    adx_consolidation_threshold: 20
+    adx_trending_threshold: 25
+    bb_squeeze_threshold: 4.0
+    volume_dry_up_threshold: 0.8
+    atr_expansion_multiplier: 1.5
+    close_strength_threshold: 0.75
+
   
   # Hybrid Strategy (combines multiple signals)
   hybrid:
