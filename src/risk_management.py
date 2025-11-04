@@ -1,9 +1,5 @@
-"""
-Advanced risk management system.
-Handles position sizing, portfolio-level risk, drawdown protection.
-"""
-
 from decimal import Decimal, getcontext, ROUND_DOWN
+import decimal
 from typing import Dict, Optional, Tuple
 import logging
 from datetime import datetime, timedelta
@@ -29,16 +25,19 @@ class RiskManager:
         self.db = db_manager
         
         # Risk parameters
-        self.risk_percent_per_trade = Decimal(str(config.get('risk_percent_per_trade', 0.01)))
-        self.max_position_size_percent = Decimal(str(config.get('max_position_size_percent', 0.10)))
-        self.max_total_exposure_percent = Decimal(str(config.get('max_total_exposure_percent', 0.50)))
-        self.default_stop_loss_percent = Decimal(str(config.get('default_stop_loss_percent', 0.015)))
-        self.default_take_profit_percent = Decimal(str(config.get('default_take_profit_percent', 0.03)))
+        self.risk_percent_per_trade = Decimal(str(config.get('risk_percent_per_trade', '0.05')))  # Increased to 5% for small accounts
+        self.max_position_size_percent = Decimal(str(config.get('max_position_size_percent', '0.20')))  # Increased to 20% for small accounts
+        self.max_total_exposure_percent = Decimal(str(config.get('max_total_exposure_percent', '0.50')))
+        self.default_stop_loss_percent = Decimal(str(config.get('default_stop_loss_percent', '0.015')))
+        self.default_take_profit_percent = Decimal(str(config.get('default_take_profit_percent', '0.03')))
         self.use_trailing_stop = config.get('use_trailing_stop', False)
-        self.trailing_stop_percent = Decimal(str(config.get('trailing_stop_percent', 0.02)))
-        self.max_drawdown_percent = Decimal(str(config.get('max_drawdown_percent', 0.15)))
-        self.min_usd_trade_value = Decimal(str(config.get('min_usd_trade_value', 10.0)))
-        self.max_concurrent_positions = config.get('max_concurrent_positions', 5)
+        self.trailing_stop_percent = Decimal(str(config.get('trailing_stop_percent', '0.02')))
+        self.max_drawdown_percent = Decimal(str(config.get('max_drawdown_percent', '0.15')))
+        self.min_usd_trade_value = Decimal(str(config.get('min_usd_trade_value', '10.0')))  # Keep at $10 to ensure positions are large enough to monitor
+        self.max_concurrent_positions = int(config.get('max_concurrent_positions', 5))
+        self.max_fee_percent = Decimal(str(config.get('max_fee_percent', '0.01')))  # 1% max fee tolerance
+        self.max_slippage_percent = Decimal(str(config.get('max_slippage_percent', '0.005')))  # 0.5% max slippage tolerance
+        self.order_fill_timeout = int(config.get('order_fill_timeout', 300))  # 5 minutes default timeout for limit orders
         
         # Track peak equity for drawdown calculation
         self.peak_equity = Decimal('0')
@@ -78,13 +77,35 @@ class RiskManager:
         
         metadata['risk_per_unit'] = float(risk_per_unit)
         
-        # Calculate base position size
-        position_size = (risk_amount / risk_per_unit).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+        # Calculate base position size with overflow protection
+        try:
+            # First do the division
+            raw_position_size = risk_amount / risk_per_unit
+            
+            # Try to quantize - if it fails, use a simpler rounding approach
+            try:
+                position_size = raw_position_size.quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+            except decimal.InvalidOperation:
+                # Quantize failed - likely due to precision issues
+                # Use simpler approach: round to 8 decimal places
+                position_size = Decimal(str(round(float(raw_position_size), 8)))
+                logger.debug(f"Used simple rounding for position size: {position_size}")
+            
+        except (decimal.Overflow, decimal.DivisionByZero) as e:
+            logger.error(f"Position size calculation failed: {e}")
+            logger.error(f"  risk_amount={risk_amount}, risk_per_unit={risk_per_unit}")
+            logger.error(f"  entry_price={entry_price}, stop_loss_price={stop_loss_price}")
+            return Decimal('0'), {'error': f'calculation_failed: {e}'}
+        
         metadata['calculated_size'] = float(position_size)
         
         # Check against maximum position size
         max_position_value = total_equity * self.max_position_size_percent
-        max_position_size = (max_position_value / entry_price).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+        try:
+            max_position_size = (max_position_value / entry_price).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+        except decimal.InvalidOperation:
+            # Quantize failed - use simple rounding
+            max_position_size = Decimal(str(round(float(max_position_value / entry_price), 8)))
         
         if position_size > max_position_size:
             logger.info(f"Position size capped by max position size: {position_size} -> {max_position_size}")
@@ -124,18 +145,29 @@ class RiskManager:
         Returns:
             Tuple of (stop_loss_price, take_profit_price)
         """
-        if side.upper() == 'BUY':
-            stop_loss = (entry_price * (Decimal('1') - self.default_stop_loss_percent))\
-                        .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
-            take_profit = (entry_price * (Decimal('1') + self.default_take_profit_percent))\
-                         .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
-        else:  # SELL
-            stop_loss = (entry_price * (Decimal('1') + self.default_stop_loss_percent))\
-                       .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
-            take_profit = (entry_price * (Decimal('1') - self.default_take_profit_percent))\
-                         .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
-        
-        return stop_loss, take_profit
+        try:
+            if side.upper() == 'BUY':
+                stop_loss = (entry_price * (Decimal('1') - self.default_stop_loss_percent))\
+                            .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+                take_profit = (entry_price * (Decimal('1') + self.default_take_profit_percent))\
+                             .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+            else:  # SELL
+                stop_loss = (entry_price * (Decimal('1') + self.default_stop_loss_percent))\
+                           .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+                take_profit = (entry_price * (Decimal('1') - self.default_take_profit_percent))\
+                             .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+            
+            return stop_loss, take_profit
+        except (decimal.InvalidOperation, decimal.Overflow) as e:
+            logger.error(f"Error calculating stop loss/take profit for entry_price={entry_price}, side={side}: {e}")
+            # Return simple percentage-based values without quantize
+            if side.upper() == 'BUY':
+                stop_loss = entry_price * (Decimal('1') - self.default_stop_loss_percent)
+                take_profit = entry_price * (Decimal('1') + self.default_take_profit_percent)
+            else:
+                stop_loss = entry_price * (Decimal('1') + self.default_stop_loss_percent)
+                take_profit = entry_price * (Decimal('1') - self.default_take_profit_percent)
+            return stop_loss, take_profit
     
     def can_open_position(
         self,

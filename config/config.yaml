@@ -33,13 +33,16 @@ trading:
 # Risk Management
 risk_management:
   # Maximum percentage of total portfolio to risk on a single trade
-  risk_percent_per_trade: 0.01  # 1%
+  risk_percent_per_trade: 0.05  # 5% (increased for small accounts)
   
   # Maximum percentage of portfolio to allocate to any single position
-  max_position_size_percent: 0.10  # 10%
+  max_position_size_percent: 0.20  # 20% (increased for small accounts)
   
   # Maximum total exposure (sum of all positions as % of portfolio)
   max_total_exposure_percent: 0.50  # 50%
+  
+  # Minimum USD value per trade (keep at $10 to ensure positions are large enough to monitor)
+  min_usd_trade_value: 10.0  # $10
   
   # Default stop loss percentage below entry
   default_stop_loss_percent: 0.015  # 1.5%
@@ -54,17 +57,17 @@ risk_management:
   # Maximum allowed drawdown before stopping trading
   max_drawdown_percent: 0.15  # 15%
   
-  # Minimum USD equivalent value to consider for trading
-  min_usd_trade_value: 10.0
-  
   # Maximum number of concurrent positions
   max_concurrent_positions: 5
   
   # Maximum fee percentage allowed per trade (as % of position value)
-  max_fee_percent: 1.0  # 1%
+  max_fee_percent: 0.02  # 2% (allows for taker fees ~0.6%)
   
   # Maximum slippage percentage allowed per trade
-  max_slippage_percent: 0.5  # 0.5%
+  max_slippage_percent: 0.01  # 1%
+  
+  # Order fill timeout (seconds to wait for limit order to fill before cancelling)
+  order_fill_timeout: 60  # 60 seconds
 
 # Strategy Selection and Parameters
 strategies:
@@ -82,6 +85,16 @@ strategies:
     bb_period: 20
     bb_std: 2.0
     volume_threshold: 1.5  # Volume must be 1.5x average
+    adx_length: 14
+    ema_fast_length: 20
+    ema_slow_length: 50
+    volume_ma_length: 20
+    adx_threshold: 15
+    volume_confirmation_multiplier: 2.5
+    price_proximity_threshold: 0.015
+    rsi_momentum_buy_lower_bound: 50
+    rsi_momentum_buy_upper_bound: 75
+    rsi_momentum_sell_upper_bound: 40
   
   # Mean Reversion Strategy Parameters
   mean_reversion:
@@ -91,14 +104,28 @@ strategies:
     rsi_extreme_oversold: 20
     rsi_extreme_overbought: 80
     mean_lookback: 50
+    stoch_length: 14
+    ema_long_length: 200
+    distance_from_mean_threshold: -5
   
   # Breakout Strategy Parameters
   breakout:
-    lookback_period: 20
+    lookback_period: 50
     volume_confirmation: true
-    volume_threshold: 2.0
+    volume_threshold: 3.0
     atr_period: 14
     atr_multiplier: 1.5
+    adx_length: 14
+    bb_period: 20
+    bb_std: 2.0
+    volume_ma_short_length: 3
+    adx_consolidation_threshold: 20
+    adx_trending_threshold: 25
+    bb_squeeze_threshold: 4.0
+    volume_dry_up_threshold: 0.8
+    atr_expansion_multiplier: 1.5
+    close_strength_threshold: 0.75
+
   
   # Hybrid Strategy (combines multiple signals)
   hybrid:
@@ -171,6 +198,6 @@ logging:
   backup_count: 10
   
   # API Response Logging (for debugging)
-  log_api_responses: false  # Log raw API responses to separate file
+  log_api_responses: true  # Log raw API responses to separate file
   api_log_file: "logs/api_responses.log"  # Separate file for API calls
   log_api_errors_only: false  # If true, only log failed API calls

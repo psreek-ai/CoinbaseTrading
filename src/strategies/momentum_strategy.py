@@ -1,7 +1,3 @@
-"""
-Momentum-based trading strategy.
-Uses MACD, RSI, Bollinger Bands, and volume confirmation.
-"""
 
 import pandas as pd
 import pandas_ta as ta
@@ -13,20 +9,6 @@ logger = logging.getLogger(__name__)
 
 
 class MomentumStrategy(BaseStrategy):
-    """
-    Momentum strategy that identifies trending markets.
-    
-    BUY signals when:
-    - Price breaks above upper Bollinger Band
-    - MACD crosses above signal line
-    - RSI between 50-70 (strong but not overbought)
-    - Volume is above average
-    
-    SELL signals when:
-    - Price drops below middle Bollinger Band
-    - MACD crosses below signal line
-    - RSI above 75 (overbought)
-    """
     
     def __init__(self, config: Dict):
         super().__init__(config)
@@ -41,46 +23,46 @@ class MomentumStrategy(BaseStrategy):
         self.bb_period = config.get('bb_period', 20)
         self.bb_std = config.get('bb_std', 2.0)
         self.volume_threshold = config.get('volume_threshold', 1.5)
-    
+        self.adx_length = config.get('adx_length', 14)
+        self.ema_fast_length = config.get('ema_fast_length', 20)
+        self.ema_slow_length = config.get('ema_slow_length', 50)
+        self.volume_ma_length = config.get('volume_ma_length', 20)
+        self.adx_threshold = config.get('adx_threshold', 15)
+        self.volume_confirmation_multiplier = config.get('volume_confirmation_multiplier', 2.5)
+        self.price_proximity_threshold = config.get('price_proximity_threshold', 0.015)
+        self.rsi_momentum_buy_lower_bound = config.get('rsi_momentum_buy_lower_bound', 50)
+        self.rsi_momentum_buy_upper_bound = config.get('rsi_momentum_buy_upper_bound', 75)
+        self.rsi_momentum_sell_upper_bound = config.get('rsi_momentum_sell_upper_bound', 40)
+
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add momentum indicators to DataFrame."""
-        # Need at least 50 periods for reliable indicators
         min_required = max(self.bb_period, self.macd_slow) + 10
         if len(df) < min_required:
             logger.debug(f"Insufficient data for indicators: {len(df)} < {min_required} periods")
             return df
         
         try:
-            # Bollinger Bands (pandas_ta appends std parameter TWICE to column names)
             bbands = df.ta.bbands(length=self.bb_period, std=self.bb_std)
             if bbands is not None and not bbands.empty:
                 df = pd.concat([df, bbands], axis=1)
             
-            # MACD
             macd = df.ta.macd(fast=self.macd_fast, slow=self.macd_slow, 
                              signal=self.macd_signal)
             if macd is not None and not macd.empty:
                 df = pd.concat([df, macd], axis=1)
             
-            # RSI
             rsi = df.ta.rsi(length=self.rsi_period)
             if rsi is not None:
                 df[f'RSI_{self.rsi_period}'] = rsi
             
-            # ADX - Trend strength indicator
-            adx = df.ta.adx(length=14)
+            adx = df.ta.adx(length=self.adx_length)
             if adx is not None and not adx.empty:
                 df = pd.concat([df, adx], axis=1)
             
-            # EMA - Trend direction filters
-            df['EMA_20'] = df.ta.ema(length=20)
-            df['EMA_50'] = df.ta.ema(length=50)
+            df[f'EMA_{self.ema_fast_length}'] = df.ta.ema(length=self.ema_fast_length)
+            df[f'EMA_{self.ema_slow_length}'] = df.ta.ema(length=self.ema_slow_length)
             
-            # Volume moving average
-            df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
+            df['Volume_MA'] = df['Volume'].rolling(window=self.volume_ma_length).mean()
             
-            # Only drop rows where critical indicators are NaN (not all columns)
-            # This preserves data where some non-critical indicators might be NaN
             critical_indicators = [
                 f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}',
                 f'MACDs_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}',
@@ -89,13 +71,12 @@ class MomentumStrategy(BaseStrategy):
                 f'BBM_{self.bb_period}_{self.bb_std}',
                 f'BBU_{self.bb_period}_{self.bb_std}'
             ]
-            # Only drop if ANY critical indicator is missing
             existing_critical = [col for col in critical_indicators if col in df.columns]
             if existing_critical:
                 initial_len = len(df)
                 df.dropna(subset=existing_critical, inplace=True)
                 
-                if len(df) < initial_len * 0.5:  # Lost more than half the data
+                if len(df) < initial_len * 0.5:
                     logger.debug(f"Significant data loss after indicator calculation: {initial_len} -> {len(df)} rows")
             
         except Exception as e:
@@ -104,13 +85,9 @@ class MomentumStrategy(BaseStrategy):
         return df
     
     def analyze(self, df: pd.DataFrame, product_id: str) -> TradingSignal:
-        """Analyze data and generate momentum signal with improved logic."""
-        
-        # Validate data
         if not self.validate_data(df):
             return TradingSignal('HOLD', confidence=0.0)
         
-        # Add indicators if not already present
         macd_check = f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         if macd_check not in df.columns:
             df = self.add_indicators(df)
@@ -118,122 +95,123 @@ class MomentumStrategy(BaseStrategy):
         if len(df) < 2:
             return TradingSignal('HOLD', confidence=0.0)
         
-        # Get latest and previous candles
         latest = df.iloc[-1]
         previous = df.iloc[-2]
         
-        # Column names (pandas_ta format - NOTE: std appears TWICE in BB column names)
-        upper_bb_col = f'BBU_{self.bb_period}_{self.bb_std}_{self.bb_std}'
-        middle_bb_col = f'BBM_{self.bb_period}_{self.bb_std}_{self.bb_std}'
-        lower_bb_col = f'BBL_{self.bb_period}_{self.bb_std}_{self.bb_std}'
+        # Bollinger Band columns from pandas_ta follow the pattern BBU_<length>_<std>
+        upper_bb_col = f'BBU_{self.bb_period}_{self.bb_std}'
+        middle_bb_col = f'BBM_{self.bb_period}_{self.bb_std}'
+        lower_bb_col = f'BBL_{self.bb_period}_{self.bb_std}'
         macd_col = f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         macd_signal_col = f'MACDs_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}'
         rsi_col = f'RSI_{self.rsi_period}'
-        adx_col = 'ADX_14'
+        adx_col = f'ADX_{self.adx_length}'
         
-        # Check for required columns
         required_cols = [upper_bb_col, middle_bb_col, lower_bb_col, 
                         macd_col, macd_signal_col, rsi_col]
         if not all(col in df.columns for col in required_cols):
             return TradingSignal('HOLD', confidence=0.0)
         
-        # Filter: Only trade in strong trends (ADX > 15)
-        if adx_col in df.columns and latest[adx_col] < 15:
+        if adx_col in df.columns and latest[adx_col] < self.adx_threshold:
             return TradingSignal('HOLD', confidence=0.0)
         
-        # CRITICAL FILTER: Confirm trend direction with EMAs
         bullish_trend = True
         bearish_trend = True
-        if 'EMA_20' in df.columns and 'EMA_50' in df.columns:
-            bullish_trend = bool(latest['EMA_20'] > latest['EMA_50'])
-            bearish_trend = bool(latest['EMA_20'] < latest['EMA_50'])
+        ema_fast_col = f'EMA_{self.ema_fast_length}'
+        ema_slow_col = f'EMA_{self.ema_slow_length}'
+        if ema_fast_col in df.columns and ema_slow_col in df.columns:
+            bullish_trend = bool(latest[ema_fast_col] > latest[ema_slow_col])
+            bearish_trend = bool(latest[ema_fast_col] < latest[ema_slow_col])
         
-        # Detect MACD crossovers
         macd_crossed_up = bool(latest[macd_col] > latest[macd_signal_col]) and bool(previous[macd_col] <= previous[macd_signal_col])
         
         macd_crossed_down = bool(latest[macd_col] < latest[macd_signal_col]) and bool(previous[macd_col] >= previous[macd_signal_col])
         
-        # Volume confirmation with HIGHER threshold (2.5x instead of 1.5x)
-        volume_high = bool(latest['Volume'] > latest['Volume_MA'] * 2.5)
+        volume_high = bool(latest['Volume'] > latest['Volume_MA'] * self.volume_confirmation_multiplier)
         
-        # Check BUY conditions - IMPROVED LOGIC
-        buy_score = 0
+        # WEIGHTED SCORING SYSTEM for better confidence granularity
+        # Max total: 100 points for perfect signal
+        buy_score = 0.0
         buy_reasons = []
         
-        # CRITICAL FIX: Buy pullback to middle BB, NOT extension above upper BB
-        price_near_middle_bb = bool(abs(latest['Close'] - latest[middle_bb_col]) / latest['Close'] < 0.015)  # Within 1.5%
-        if price_near_middle_bb and bullish_trend:
-            buy_score += 2
-            buy_reasons.append("Pullback to middle BB in uptrend")
-        
+        # CRITICAL FACTORS (30 points each) - Strong momentum indicators
         if macd_crossed_up:
-            buy_score += 2  # MACD crossover is stronger signal
+            buy_score += 30.0
             buy_reasons.append("MACD bullish crossover")
         
-        # RSI confirmation (momentum building, not overbought)
-        rsi_in_momentum_zone = bool(50 < latest[rsi_col] < 75)
-        if rsi_in_momentum_zone:
-            buy_score += 1
-            buy_reasons.append(f"RSI confirming momentum ({latest[rsi_col]:.1f})")
+        # HIGH IMPORTANCE (20 points each) - Trend confirmation
+        price_near_middle_bb = bool(abs(latest['Close'] - latest[middle_bb_col]) / latest['Close'] < self.price_proximity_threshold)
+        if price_near_middle_bb and bullish_trend:
+            buy_score += 20.0
+            buy_reasons.append("Pullback to middle BB in uptrend")
         
-        # IMPROVED: Higher volume threshold
-        if volume_high:
-            buy_score += 1
-            buy_reasons.append("Strong volume confirmation (>2.5x average)")
-        
-        # EMA trend alignment
         if bullish_trend:
-            buy_score += 1
+            buy_score += 20.0
             buy_reasons.append("EMA bullish alignment")
         
-        # --- NEW LOGIC: Calculate confidence and let main loop filter ---
+        # MODERATE IMPORTANCE (15 points each) - Momentum confirmation
+        rsi_in_momentum_zone = bool(self.rsi_momentum_buy_lower_bound < latest[rsi_col] < self.rsi_momentum_buy_upper_bound)
+        if rsi_in_momentum_zone:
+            buy_score += 15.0
+            buy_reasons.append(f"RSI confirming momentum ({latest[rsi_col]:.1f})")
         
-        # Calculate buy confidence (max score is 6)
-        buy_confidence = min(buy_score / 6.0, 1.0)
+        # SUPPORTING FACTORS (15 points) - Volume validation
+        if volume_high:
+            buy_score += 15.0
+            buy_reasons.append(f"Strong volume confirmation (>{self.volume_confirmation_multiplier}x average)")
         
-        # Check SELL conditions - IMPROVED
-        sell_score = 0
+        buy_confidence = min(buy_score / 100.0, 1.0)
+        
+        # SELL SCORING (weighted)
+        sell_score = 0.0
         sell_reasons = []
         
+        # CRITICAL FACTORS (35 points) - Strong reversal signal
         if macd_crossed_down:
-            sell_score += 2
+            sell_score += 35.0
             sell_reasons.append("MACD bearish crossover")
         
-        # ADX falling (trend weakening)
+        # HIGH IMPORTANCE (25 points) - Trend breakdown
+        if bearish_trend:
+            sell_score += 25.0
+            sell_reasons.append("EMA bearish alignment")
+        
+        # MODERATE IMPORTANCE (20 points each) - Momentum loss
+        if bool(latest[rsi_col] < self.rsi_momentum_sell_upper_bound):
+            sell_score += 20.0
+            sell_reasons.append(f"RSI momentum lost ({latest[rsi_col]:.1f})")
+        
+        price_below_middle = bool(latest['Close'] < latest[middle_bb_col])
+        if price_below_middle:
+            sell_score += 20.0
+            sell_reasons.append("Price below middle BB")
+        
+        # SUPPORTING FACTORS (20 points) - Weakening trend
         if adx_col in df.columns and len(df) > 3:
             adx_falling = bool(latest[adx_col] < df.iloc[-3][adx_col])
             if adx_falling:
-                sell_score += 1
+                sell_score += 20.0
                 sell_reasons.append("ADX falling, trend weakening")
         
-        # RSI momentum lost
-        if bool(latest[rsi_col] < 40):
-            sell_score += 1
-            sell_reasons.append(f"RSI momentum lost ({latest[rsi_col]:.1f})")
+        sell_confidence = min(sell_score / 100.0, 1.0)
         
-        # Price below middle BB
-        price_below_middle = bool(latest['Close'] < latest[middle_bb_col])
-        if price_below_middle:
-            sell_score += 1
-            sell_reasons.append("Price below middle BB")
-        
-        # Calculate sell confidence (max score is 5)
-        sell_confidence = min(sell_score / 5.0, 1.0)
-        
-        # Return the strongest signal
+        # Determine signal based on confidence comparison
         if buy_confidence > sell_confidence and buy_confidence > 0:
-            logger.debug(f"BUY signal for {product_id}: score={buy_score}, confidence={buy_confidence:.2f}")
+            logger.debug(f"BUY signal for {product_id}: score={buy_score:.1f}/100, confidence={buy_confidence:.1%}")
             return TradingSignal('BUY', confidence=buy_confidence, 
                                metadata={'reasons': buy_reasons, 'score': buy_score})
         
         if sell_confidence > buy_confidence and sell_confidence > 0:
-            logger.debug(f"SELL signal for {product_id}: score={sell_score}, confidence={sell_confidence:.2f}")
+            logger.debug(f"SELL signal for {product_id}: score={sell_score:.1f}/100, confidence={sell_confidence:.1%}")
             return TradingSignal('SELL', confidence=sell_confidence,
                                metadata={'reasons': sell_reasons, 'score': sell_score})
 
-        # HOLD
-        return TradingSignal('HOLD', confidence=0.5,
+        # HOLD signal - confidence reflects proximity to action threshold
+        # Higher scores indicate closer to triggering a signal
+        hold_confidence = max(buy_confidence, sell_confidence)
+        return TradingSignal('HOLD', confidence=hold_confidence,
                            metadata={'latest_rsi': latest[rsi_col],
                                    'latest_close': latest['Close'],
-                                   'adx': latest[adx_col] if adx_col in df.columns else None})
-
+                                   'adx': latest[adx_col] if adx_col in df.columns else None,
+                                   'buy_score': buy_score,
+                                   'sell_score': sell_score})

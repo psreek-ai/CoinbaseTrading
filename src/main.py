@@ -1,31 +1,15 @@
-"""
-Robust Automated Algorithmic Crypto Trading Bot for Coinbase
-============================================================
-
-Features:
-- Multiple trading strategies (Momentum, Mean Reversion, Breakout, Hybrid)
-- Advanced risk management with position sizing and portfolio-level controls
-- Performance analytics (Sharpe ratio, win rate, equity curve tracking)
-- Database persistence for orders, positions, and metrics
-- Configurable via YAML files
-- Paper trading mode for testing
-- WebSocket real-time price feeds
-- Comprehensive logging and error handling
-
-Author: AI Trading Bot System
-Version: 2.1 (Enhanced Edition)
-"""
 
 import sys
 import time
 import logging
-import signal
+import signal as signal_module
 import json
 from pathlib import Path
 from decimal import Decimal
 from datetime import datetime, UTC
 from typing import Dict, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Event
 
 # Add src directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -36,28 +20,12 @@ from api_client import CoinbaseAPI
 from strategies import StrategyFactory
 from risk_management import RiskManager
 from analytics import PerformanceAnalytics
-
-# Global shutdown flag
-shutdown_requested = False
-
-
-def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully."""
-    global shutdown_requested
-    logger.info("Shutdown signal received. Cleaning up...")
-    shutdown_requested = True
-
+from trade_executor import TradeExecutor
+from market_scanner import MarketScanner
 
 class TradingBot:
-    """Main trading bot class."""
     
     def __init__(self, config_path: str = None):
-        """
-        Initialize trading bot.
-        
-        Args:
-            config_path: Path to configuration file
-        """
         # Load configuration
         self.config = get_config(config_path)
         
@@ -75,6 +43,20 @@ class TradingBot:
         self.risk_manager = self._initialize_risk_manager()
         self.analytics = self._initialize_analytics()
         
+        # Initialize new components
+        self.trade_executor = TradeExecutor(
+            self.api,
+            self.db,
+            self.risk_manager,
+            self.config.get('trading.paper_trading_mode', True),
+            self.config.get('strategies.active_strategy')
+        )
+        self.market_scanner = MarketScanner(
+            self.api,
+            self.strategy,
+            self.config
+        )
+
         # Bot state
         self.portfolio_id = None
         self.paper_trading = self.config.get('trading.paper_trading_mode', True)
@@ -88,6 +70,13 @@ class TradingBot:
         logger.info(f"Paper Trading Mode: {self.paper_trading}")
         logger.info(f"Active Strategy: {self.config.get('strategies.active_strategy')}")
         
+        # Shutdown event
+        self._shutdown_event = Event()
+
+    def _signal_handler(self, signum, frame):
+        logger.info("Shutdown signal received. Cleaning up...")
+        self._shutdown_event.set()
+
     def _setup_logging(self):
         """Configure logging."""
         global logger
@@ -96,7 +85,9 @@ class TradingBot:
         log_dir = Path(self.config.get('logging.log_directory', 'logs'))
         log_dir.mkdir(exist_ok=True)
         
-        log_file = log_dir / f"trading_bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        # Use same timestamp for all log files in this session
+        self.log_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = log_dir / f"trading_bot_{self.log_timestamp}.log"
         
         # Configure root logger
         logging.basicConfig(
@@ -125,9 +116,11 @@ class TradingBot:
         
         # Enable API response logging if configured
         if self.config.get('logging.log_api_responses', False):
-            log_file = self.config.get('logging.api_log_file', 'logs/api_responses.log')
+            # Use same timestamp as main log file
+            log_dir = Path(self.config.get('logging.log_directory', 'logs'))
+            log_file = log_dir / f"api_responses_{self.log_timestamp}.log"
             errors_only = self.config.get('logging.log_api_errors_only', False)
-            api.enable_api_logging(log_file=log_file, errors_only=errors_only)
+            api.enable_api_logging(log_file=str(log_file), errors_only=errors_only)
         
         # Check API permissions
         permissions = api.check_api_permissions()
@@ -223,727 +216,30 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Error updating order from WebSocket callback: {e}")
     
-    def execute_buy_order(
-        self,
-        product_id: str,
-        balances: Dict[str, Decimal],
-        product_details: Dict,
-        signal_metadata: Dict
-    ):
+    def _auto_convert_holdings(self, sell_signals: List[Dict], hold_signals: List[Dict], buy_opportunities: List[Dict]):
         """
-        Execute a buy order with full risk management and order preview.
+        Automatically convert holdings into BUY opportunities.
+        - SELL signals: Always convert (weak holdings)
+        - HOLD signals: Convert only if BUY confidence is significantly higher (e.g., 20% better)
         
-        Args:
-            product_id: Product to buy
-            balances: Current balances
-            product_details: Product trading rules
-            signal_metadata: Metadata from trading signal
-        """
-        base_currency, quote_currency = product_id.split('-')
-        
-        # Check if we already have this asset
-        if base_currency in balances:
-            logger.info(f"Already holding {base_currency}, skipping buy")
-            return
-        
-        # Check quote balance
-        quote_balance = balances.get(quote_currency, Decimal('0'))
-        if quote_balance <= 0:
-            logger.warning(f"No {quote_currency} balance to buy {product_id}")
-            return
-        
-        # Get total equity
-        total_equity = self._get_total_equity(balances)
-        if total_equity <= 0:
-            logger.warning("Cannot calculate total equity")
-            return
-        
-        # Get entry price with best bid/ask analysis
-        bid_ask = self.api.get_best_bid_ask([product_id])
-        
-        if bid_ask and product_id in bid_ask:
-            best_ask = bid_ask[product_id]['best_ask']
-            spread = bid_ask[product_id]['spread']
-            spread_pct = bid_ask[product_id]['spread_pct']
-            
-            # Check if spread is reasonable
-            max_spread_pct = 0.5  # 0.5% max spread
-            if spread_pct and spread_pct > max_spread_pct:
-                logger.warning(f"Spread too wide ({spread_pct:.2f}% > {max_spread_pct}%), skipping entry")
-                return
-            
-            # Place limit order slightly better than best ask (try to earn maker rebate)
-            tick_size = Decimal('0.01')  # Adjust based on product
-            entry_price = best_ask - tick_size if best_ask else self.api.get_latest_price(product_id)
-            
-            logger.info(f"Spread analysis: Best Ask=${best_ask}, Spread={spread_pct:.3f}%, Entry=${entry_price}")
-        else:
-            # Fallback to latest price if bid/ask not available
-            entry_price = self.api.get_latest_price(product_id)
-            if not entry_price:
-                logger.warning(f"No price available for {product_id}")
-                return
-        
-        # Analyze volume flow for confirmation
-        volume_flow = self.api.analyze_volume_flow(product_id, lookback_trades=100)
-        buy_pressure = volume_flow.get('buy_pressure', 0.5)
-        net_pressure = volume_flow.get('net_pressure', 'neutral')
-        
-        logger.info(f"Volume flow: {buy_pressure:.1%} buy pressure ({net_pressure})")
-        
-        # Require moderate buy pressure for entry
-        if buy_pressure < 0.45:
-            logger.warning(f"Insufficient buy pressure ({buy_pressure:.1%}), skipping entry")
-            return
-        
-        # Calculate stop loss and take profit
-        stop_loss, take_profit = self.risk_manager.calculate_stop_loss_take_profit(
-            entry_price, side='BUY'
-        )
-        
-        # Calculate position size
-        product_info = product_details.get(product_id, {})
-        min_size = product_info.get('base_min_size', Decimal('0'))
-        
-        position_size, sizing_metadata = self.risk_manager.calculate_position_size(
-            total_equity, entry_price, stop_loss, min_size
-        )
-        
-        if position_size <= 0:
-            logger.warning(f"Position size calculation failed: {sizing_metadata}")
-            return
-        
-        # Check if we can open this position
-        open_positions = self.db.get_open_positions()
-        current_exposure = Decimal('0')
-        
-        for pos in open_positions:
-            try:
-                size = Decimal(str(pos['base_size']))
-                price = Decimal(str(pos.get('current_price', pos['entry_price'])))
-                current_exposure += (size * price) / total_equity
-            except Exception as e:
-                logger.error(f"Error calculating exposure: {e}")
-        
-        position_value = position_size * entry_price
-        can_open, reason = self.risk_manager.can_open_position(
-            len(open_positions), current_exposure, total_equity, position_value
-        )
-        
-        if not can_open:
-            logger.warning(f"Cannot open position: {reason}")
-            return
-        
-        # Preview the order first
-        logger.info(f"Previewing order for {product_id}...")
-        preview = self.api.preview_order(
-            product_id=product_id,
-            side='BUY',
-            size=position_size
-        )
-        
-        if not preview:
-            logger.error("Order preview failed - aborting trade")
-            return
-        
-        # Check fees and slippage
-        max_fee_percent = self.config.get('risk_management.max_fee_percent', Decimal('1.0'))
-        max_slippage_percent = self.config.get('risk_management.max_slippage_percent', Decimal('0.5'))
-        
-        fee_percent = (preview['commission_total'] / position_value) * Decimal('100')
-        slippage_percent = preview['slippage']
-        
-        if fee_percent > max_fee_percent:
-            logger.warning(f"Fee too high: {fee_percent:.2f}% > {max_fee_percent}% - aborting trade")
-            return
-        
-        if slippage_percent > max_slippage_percent:
-            logger.warning(f"Slippage too high: {slippage_percent:.2f}% > {max_slippage_percent}% - aborting trade")
-            return
-        
-        # Use preview's average price for more accurate entry
-        actual_entry_price = preview['average_filled_price']
-        actual_size = preview['base_size']
-        
-        # Execute order
-        logger.info("=" * 60)
-        logger.info(f"EXECUTING BUY ORDER: {product_id}")
-        logger.info(f"Size: {actual_size} | Entry: {actual_entry_price}")
-        logger.info(f"Fee: ${preview['commission_total']:.4f} ({fee_percent:.2f}%)")
-        logger.info(f"Slippage: {slippage_percent:.2f}%")
-        logger.info(f"Stop Loss: {stop_loss} | Take Profit: {take_profit}")
-        logger.info(f"Position Value: ${position_value:.2f}")
-        logger.info("=" * 60)
-        
-        if self.paper_trading:
-            # Paper trading: Simulate limit order with post-only
-            order_id = f"PAPER_LIMIT_{datetime.now().strftime('%Y%m%d%H%M%S')}_{product_id}"
-            
-            # Save to database with preview data
-            self.db.insert_order({
-                'client_order_id': order_id,
-                'product_id': product_id,
-                'side': 'BUY',
-                'order_type': 'limit_gtc_post_only',
-                'status': 'filled',
-                'base_size': actual_size,
-                'entry_price': actual_entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'metadata': {
-                    'signal': signal_metadata,
-                    'sizing': sizing_metadata,
-                    'preview': {
-                        'commission': float(preview['commission_total']),
-                        'slippage': float(slippage_percent),
-                        'fee_percent': float(fee_percent)
-                    },
-                    'volume_flow': {
-                        'buy_pressure': float(buy_pressure),
-                        'net_pressure': net_pressure
-                    },
-                    'spread_analysis': {
-                        'spread_pct': spread_pct if 'spread_pct' in locals() else None
-                    },
-                    'paper_trade': True,
-                    'post_only': True  # Flag that this earns maker rebates
-                }
-            })
-            
-            # Open position with preview data
-            self.db.insert_position({
-                'product_id': product_id,
-                'base_size': actual_size,
-                'entry_price': actual_entry_price,
-                'current_price': actual_entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'entry_order_id': order_id,
-                'metadata': {
-                    'strategy': self.strategy.name,
-                    'signal': signal_metadata,
-                    'fees_paid': float(preview['commission_total']),
-                    'bracket_order': True  # Simulated bracket order
-                }
-            })
-            
-            # Start WebSocket for this product to monitor in real-time
-            try:
-                open_positions = self.db.get_open_positions()
-                position_products = [p['product_id'] for p in open_positions]
-                if position_products and not hasattr(self.api, 'websocket_running'):
-                    # Paper trading: ticker only
-                    self.api.start_websocket(position_products, enable_user_channel=False)
-                    logger.info(f"WebSocket started for {len(position_products)} open positions")
-                elif position_products:
-                    # WebSocket already running, just log
-                    logger.debug(f"Monitoring {len(position_products)} positions via WebSocket")
-            except Exception as e:
-                logger.warning(f"Could not start WebSocket: {e}")
-            
-            logger.info(f"[PAPER] Limit order (post-only) simulated: {order_id}")
-            
-        else:
-            # Live trading: Place limit order with post-only for maker rebates
-            logger.info("Placing live limit order with post-only (earning maker rebates)...")
-            
-            limit_order = self.api.place_limit_order_gtc(
-                product_id=product_id,
-                side='BUY',
-                price=entry_price,
-                size=actual_size,
-                post_only=True  # CRITICAL: Ensures maker order (earns rebates)
-            )
-            
-            if not limit_order:
-                logger.error("Failed to place limit order")
-                return
-            
-            order_id = limit_order['order_id']
-            logger.info(f"Limit order placed: {order_id}")
-            
-            # Save order to database with 'submitted' status
-            self.db.insert_order({
-                'client_order_id': order_id,
-                'product_id': product_id,
-                'side': 'BUY',
-                'order_type': 'limit_gtc_post_only',
-                'status': 'submitted',
-                'base_size': actual_size,
-                'entry_price': entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'metadata': {
-                    'signal': signal_metadata,
-                    'sizing': sizing_metadata,
-                    'post_only': True,
-                    'submitted_at': datetime.utcnow().isoformat()
-                }
-            })
-            
-            # Monitor order for fill (wait up to 30 seconds)
-            logger.info(f"Monitoring limit order {order_id} for fill...")
-            import time
-            filled = False
-            for i in range(30):
-                time.sleep(1)
-                order_status = self.api.get_order_status(order_id)
-                if order_status and order_status['status'] in ['FILLED', 'CANCELLED', 'EXPIRED']:
-                    filled = order_status['status'] == 'FILLED'
-                    logger.info(f"Order {order_id} status: {order_status['status']}")
-                    break
-            
-            if not filled:
-                logger.warning(f"Limit order {order_id} not filled within 30s - cancelling to prevent ghost order")
-                
-                # CRITICAL: Cancel the order to prevent it from becoming a ghost order
-                try:
-                    cancel_result = self.api.cancel_order(order_id)
-                    if cancel_result:
-                        logger.info(f"Successfully cancelled unfilled order: {order_id}")
-                        
-                        # Update order status in database
-                        cursor = self.db.conn.cursor()
-                        cursor.execute(
-                            "UPDATE orders SET status = 'cancelled', metadata = json_set(metadata, '$.cancelled_at', ?) WHERE client_order_id = ?",
-                            (datetime.utcnow().isoformat(), order_id)
-                        )
-                        self.db.conn.commit()
-                    else:
-                        logger.error(f"Failed to cancel order {order_id} - GHOST ORDER RISK!")
-                        logger.error("This order may fill later without the bot's knowledge!")
-                except Exception as e:
-                    logger.error(f"Exception while cancelling order {order_id}: {e}")
-                    logger.error("CRITICAL: Ghost order may exist on exchange!")
-                
-                return
-            
-            # Get actual fill details
-            fills = self.api.get_fills(order_id=order_id)
-            actual_fill_price = entry_price
-            actual_commission = Decimal('0')
-            
-            if fills:
-                # Calculate average fill price and total commission
-                total_size = sum(f['size'] for f in fills)
-                weighted_price = sum(f['price'] * f['size'] for f in fills)
-                actual_fill_price = weighted_price / total_size if total_size > 0 else entry_price
-                actual_commission = sum(f['commission'] for f in fills)
-                
-                # Log maker/taker status
-                maker_count = sum(1 for f in fills if f.get('liquidity_indicator') == 'MAKER')
-                logger.info(f"Fill details: {maker_count}/{len(fills)} fills were MAKER (earning rebates)")
-            
-            # Save to database
-            self.db.insert_order({
-                'client_order_id': order_id,
-                'product_id': product_id,
-                'side': 'BUY',
-                'order_type': 'limit_gtc_post_only',
-                'status': 'filled',
-                'base_size': actual_size,
-                'entry_price': actual_fill_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'metadata': {
-                    'signal': signal_metadata,
-                    'sizing': sizing_metadata,
-                    'preview': {
-                        'commission': float(preview['commission_total']),
-                        'slippage': float(slippage_percent),
-                        'fee_percent': float(fee_percent)
-                    },
-                    'actual_fills': {
-                        'commission': float(actual_commission),
-                        'avg_price': float(actual_fill_price),
-                        'num_fills': len(fills) if fills else 0
-                    },
-                    'live_trade': True,
-                    'post_only': True
-                }
-            })
-            
-            # Now create stop-loss and take-profit orders
-            logger.info(f"Creating stop-loss order at ${stop_loss}...")
-            stop_order = self.api.create_stop_limit_order(
-                product_id=product_id,
-                side='SELL',
-                base_size=actual_size,
-                limit_price=stop_loss * Decimal('0.99'),  # Limit slightly below stop
-                stop_price=stop_loss
-            )
-            
-            logger.info(f"Creating take-profit order at ${take_profit}...")
-            tp_order = self.api.place_limit_order_gtc(
-                product_id=product_id,
-                side='SELL',
-                price=take_profit,
-                size=actual_size,
-                post_only=False  # Take profit can be taker
-            )
-            
-            # Open position with actual fill price
-            self.db.insert_position({
-                'product_id': product_id,
-                'base_size': actual_size,
-                'entry_price': actual_fill_price,
-                'current_price': actual_fill_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'entry_order_id': order_id,
-                'metadata': {
-                    'strategy': self.strategy.name,
-                    'signal': signal_metadata,
-                    'fees_paid': float(actual_commission),
-                    'stop_order_id': stop_order['order_id'] if stop_order else None,
-                    'tp_order_id': tp_order['order_id'] if tp_order else None,
-                    'post_only_entry': True
-                }
-            })
-            
-            # Start WebSocket to monitor (with user channel for live trading)
-            try:
-                open_positions = self.db.get_open_positions()
-                position_products = [p['product_id'] for p in open_positions]
-                if position_products and not hasattr(self.api, 'websocket_running'):
-                    # Live trading: enable user channel for real-time order updates
-                    self.api.start_websocket(position_products, enable_user_channel=True)
-                    logger.info(f"WebSocket started with user channel for {len(position_products)} open positions")
-            except Exception as e:
-                logger.warning(f"Could not start WebSocket: {e}")
-            
-            logger.info(f"[LIVE] Bracket order created: {order_id}")
-    
-    def execute_sell_order(
-        self,
-        product_id: str,
-        position: Dict,
-        exit_reason: str = 'signal'
-    ):
-        """
-        Execute a sell order.
-        
-        Args:
-            product_id: Product to sell
-            position: Position data
-            exit_reason: Reason for exit
-        """
-        base_currency = product_id.split('-')[0]
-        
-        position_size = Decimal(str(position['base_size']))
-        entry_price = Decimal(str(position['entry_price']))
-        
-        # Get current price
-        current_price = self.api.get_latest_price(product_id)
-        if not current_price:
-            logger.warning(f"No price available for {product_id}")
-            return
-        
-        # Calculate PnL
-        pnl = (current_price - entry_price) * position_size
-        pnl_percent = ((current_price - entry_price) / entry_price) * 100
-        
-        logger.info("=" * 60)
-        logger.info(f"EXECUTING SELL ORDER: {product_id}")
-        logger.info(f"Size: {position_size} | Exit Price: {current_price}")
-        logger.info(f"Entry: {entry_price} | PnL: ${pnl:.2f} ({pnl_percent:.2f}%)")
-        logger.info(f"Exit Reason: {exit_reason}")
-        logger.info("=" * 60)
-        
-        if self.paper_trading:
-            order_id = f"PAPER_{datetime.now().strftime('%Y%m%d%H%M%S')}_{product_id}_SELL"
-            
-            # Save sell order
-            self.db.insert_order({
-                'client_order_id': order_id,
-                'product_id': product_id,
-                'side': 'SELL',
-                'order_type': 'market',
-                'status': 'filled',
-                'base_size': position_size,
-                'filled_price': current_price,
-                'metadata': {
-                    'exit_reason': exit_reason,
-                    'paper_trade': True
-                }
-            })
-            
-            # Close position
-            self.db.close_position(product_id, float(current_price), float(pnl))
-            
-            # Record trade history
-            entry_time = position.get('opened_at')
-            exit_time = datetime.utcnow().isoformat()
-            
-            holding_time = None
-            if entry_time:
-                try:
-                    entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
-                    exit_dt = datetime.fromisoformat(exit_time.replace('Z', '+00:00'))
-                    holding_time = int((exit_dt - entry_dt).total_seconds())
-                except:
-                    pass
-            
-            self.db.insert_trade_history({
-                'product_id': product_id,
-                'side': 'BUY',  # Original side
-                'entry_price': entry_price,
-                'exit_price': current_price,
-                'size': position_size,
-                'pnl': pnl,
-                'pnl_percent': pnl_percent,
-                'entry_time': entry_time or datetime.utcnow().isoformat(),
-                'exit_time': exit_time,
-                'holding_time_seconds': holding_time,
-                'strategy': self.strategy.name,
-                'exit_reason': exit_reason
-            })
-            
-            logger.info(f"[PAPER] SELL order executed: {order_id}")
-        else:
-            # Live trading: Place market sell order
-            logger.info("Placing live market SELL order...")
-            
-            # First, cancel any open SL/TP orders for this position
-            metadata = position.get('metadata', {})
-            stop_order_id = metadata.get('stop_order_id')
-            tp_order_id = metadata.get('tp_order_id')
-            
-            cancelled_orders = []
-            if stop_order_id:
-                try:
-                    cancel_result = self.api.cancel_order(stop_order_id)
-                    if cancel_result:
-                        logger.info(f"Cancelled stop-loss order: {stop_order_id}")
-                        cancelled_orders.append(stop_order_id)
-                except Exception as e:
-                    logger.warning(f"Could not cancel stop-loss order {stop_order_id}: {e}")
-            
-            if tp_order_id:
-                try:
-                    cancel_result = self.api.cancel_order(tp_order_id)
-                    if cancel_result:
-                        logger.info(f"Cancelled take-profit order: {tp_order_id}")
-                        cancelled_orders.append(tp_order_id)
-                except Exception as e:
-                    logger.warning(f"Could not cancel take-profit order {tp_order_id}: {e}")
-            
-            # Place market sell order
-            sell_order = self.api.place_market_order(
-                product_id=product_id,
-                side='SELL',
-                size=float(position_size)
-            )
-            
-            if not sell_order:
-                logger.error(f"Failed to place market SELL order for {product_id}")
-                return
-            
-            order_id = sell_order['order_id']
-            logger.info(f"Market SELL order placed: {order_id}")
-            
-            # Wait for fill confirmation (market orders fill quickly)
-            import time
-            filled = False
-            actual_fill_price = current_price
-            actual_commission = Decimal('0')
-            
-            for i in range(10):  # Wait up to 10 seconds for market order fill
-                time.sleep(1)
-                order_status = self.api.get_order_status(order_id)
-                if order_status and order_status['status'] == 'FILLED':
-                    filled = True
-                    logger.info(f"Market SELL order filled: {order_id}")
-                    
-                    # Get actual fill details
-                    fills = self.api.get_fills(order_id=order_id)
-                    if fills:
-                        total_size = sum(Decimal(str(f['size'])) for f in fills)
-                        weighted_price = sum(Decimal(str(f['price'])) * Decimal(str(f['size'])) for f in fills)
-                        actual_fill_price = weighted_price / total_size if total_size > 0 else current_price
-                        actual_commission = sum(Decimal(str(f['commission'])) for f in fills)
-                        
-                        logger.info(f"Fill price: {actual_fill_price}, Commission: {actual_commission}")
-                    break
-            
-            if not filled:
-                logger.error(f"Market SELL order did not fill within 10 seconds: {order_id}")
-                logger.error("CRITICAL: Position may still be open on exchange but bot cannot confirm!")
-                return
-            
-            # Recalculate PnL with actual fill price
-            pnl = (actual_fill_price - entry_price) * position_size
-            pnl_percent = ((actual_fill_price - entry_price) / entry_price) * 100
-            
-            # Save sell order to database
-            self.db.insert_order({
-                'client_order_id': order_id,
-                'product_id': product_id,
-                'side': 'SELL',
-                'order_type': 'market',
-                'status': 'filled',
-                'base_size': position_size,
-                'filled_price': actual_fill_price,
-                'metadata': {
-                    'exit_reason': exit_reason,
-                    'fees_paid': float(actual_commission),
-                    'cancelled_orders': cancelled_orders,
-                    'paper_trade': False
-                }
-            })
-            
-            # Close position in database
-            self.db.close_position(product_id, float(actual_fill_price), float(pnl))
-            
-            # Record trade history
-            entry_time = position.get('opened_at')
-            exit_time = datetime.utcnow().isoformat()
-            
-            holding_time = None
-            if entry_time:
-                try:
-                    entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
-                    exit_dt = datetime.fromisoformat(exit_time.replace('Z', '+00:00'))
-                    holding_time = int((exit_dt - entry_dt).total_seconds())
-                except:
-                    pass
-            
-            self.db.insert_trade_history({
-                'product_id': product_id,
-                'side': 'BUY',  # Original entry side
-                'entry_price': entry_price,
-                'exit_price': actual_fill_price,
-                'size': position_size,
-                'pnl': pnl,
-                'pnl_percent': pnl_percent,
-                'entry_time': entry_time or datetime.utcnow().isoformat(),
-                'exit_time': exit_time,
-                'holding_time_seconds': holding_time,
-                'strategy': self.strategy.name,
-                'exit_reason': exit_reason
-            })
-            
-            logger.info(f"[LIVE] SELL order executed: {order_id}")
-            logger.info(f"[LIVE] PnL: ${pnl:.2f} ({pnl_percent:.2f}%)")
-            logger.info(f"[LIVE] Position closed for {product_id}")
-    
-    def _analyze_current_holdings(self, balances: Dict[str, Decimal]):
-        """
-        Analyze current crypto holdings to determine if they should be held or sold (OPTIMIZED).
-        Uses parallel processing for faster analysis.
-        
-        Args:
-            balances: Current account balances
-        """
-        crypto_holdings = []
-        
-        # Identify crypto assets (not USD/USDC)
-        for asset, balance in balances.items():
-            if asset not in ['USD', 'USDC'] and balance > 0:
-                # Get current price
-                price = self.api.get_latest_price(f"{asset}-USD")
-                if not price:
-                    price = self.api.get_latest_price(f"{asset}-USDC")
-                
-                if price:
-                    usd_value = balance * price
-                    crypto_holdings.append({
-                        'asset': asset,
-                        'balance': balance,
-                        'usd_value': usd_value,
-                        'price': price
-                    })
-        
-        if not crypto_holdings:
-            logger.info("No crypto holdings to analyze")
-            return
-        
-        logger.info(f"Analyzing {len(crypto_holdings)} current holdings in parallel...")
-        
-        granularity = self.config.get('trading.candle_granularity', 'FIFTEEN_MINUTE')
-        periods = self.config.get('trading.candle_periods_for_analysis', 200)
-        min_sell_confidence = self.config.get('trading.min_signal_confidence', 0.5)
-        
-        def analyze_holding(holding):
-            """Analyze a single holding."""
-            asset = holding['asset']
-            product_id = f"{asset}-USD"
-            
-            try:
-                df = self.api.get_historical_data(product_id, granularity, periods)
-                
-                if df.empty or len(df) < 50:
-                    logger.debug(f"Insufficient data for {product_id}")
-                    return None
-                
-                signal = self.strategy.analyze(df, product_id)
-                
-                return {
-                    'asset': asset,
-                    'product_id': product_id,
-                    'signal': signal.action,
-                    'confidence': signal.confidence,
-                    'balance': holding['balance'],  # Add balance for conversions
-                    'usd_value': holding['usd_value'],
-                    'metadata': signal.metadata
-                }
-            
-            except Exception as e:
-                logger.debug(f"Error analyzing holding {product_id}: {e}")
-                return None
-        
-        # OPTIMIZATION: Analyze holdings in parallel
-        holding_signals = []
-        max_workers = self.config.get('trading.max_holdings_workers', 3)
-        max_workers = min(max_workers, len(crypto_holdings))  # Don't exceed number of holdings
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(analyze_holding, h): h for h in crypto_holdings}
-            
-            for future in as_completed(futures):
-                if shutdown_requested:
-                    logger.info("Shutdown requested, stopping holdings analysis...")
-                    break
-                
-                result = future.result()
-                if result:
-                    holding_signals.append(result)
-                    
-                    # Log the signal
-                    if result['signal'] == 'SELL' and result['confidence'] >= min_sell_confidence:
-                        logger.warning(f"[SELL] {result['asset']}: SELL signal (confidence: {result['confidence']:.2f}) - Value: ${result['usd_value']:.2f}")
-                        reasons = result['metadata'].get('reasons', [])
-                        if reasons:
-                            logger.warning(f"   Reasons: {', '.join(reasons)}")
-                    elif result['signal'] == 'BUY':
-                        logger.info(f"[BUY/HOLD] {result['asset']}: BUY/HOLD signal (confidence: {result['confidence']:.2f}) - Value: ${result['usd_value']:.2f}")
-                    else:
-                        logger.info(f"[HOLD] {result['asset']}: HOLD (no strong signal) - Value: ${result['usd_value']:.2f}")
-        
-        # Summary and return SELL signals for potential conversion
-        should_sell = [h for h in holding_signals if h['signal'] == 'SELL' and h['confidence'] >= min_sell_confidence]
-        
-        if should_sell:
-            logger.warning(f"WARNING: {len(should_sell)} holdings have SELL signals:")
-            for h in should_sell:
-                logger.warning(f"   - {h['asset']}: ${h['usd_value']:.2f} (confidence: {h['confidence']:.1%})")
-        
-        return should_sell  # Return holdings with SELL signals for potential conversion
-    
-    def _auto_convert_holdings(self, sell_signals: List[Dict], buy_opportunities: List[Dict]):
-        """
-        Automatically convert holdings with SELL signals into BUY opportunities.
         Uses Coinbase Convert API for direct crypto-to-crypto conversion.
         
         Args:
             sell_signals: List of holdings with SELL signals
+            hold_signals: List of holdings with HOLD signals
             buy_opportunities: List of BUY opportunities from market scan
         """
-        if not sell_signals or not buy_opportunities:
+        if not buy_opportunities:
             return
         
-        # Sort sell signals by confidence (strongest sell first)
+        if not sell_signals and not hold_signals:
+            return
+        
+        # Sort sell signals by confidence (strongest sell first - priority conversions)
         sell_signals.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        # Sort hold signals by confidence (weakest hold first - easier to justify conversion)
+        hold_signals.sort(key=lambda x: x.get('confidence', 0), reverse=False)
         
         # Sort buy opportunities by confidence (strongest buy first)
         buy_opportunities.sort(key=lambda x: x['confidence'], reverse=True)
@@ -951,9 +247,16 @@ class TradingBot:
         logger.info("\n" + "=" * 80)
         logger.info("AUTO-CONVERSION ANALYSIS")
         logger.info("=" * 80)
-        logger.info("Assets with SELL signals:")
-        for s in sell_signals:
-            logger.info(f"  - {s['asset']:10s}: ${s['usd_value']:>10.2f} (confidence: {s['confidence']:.1%})")
+        
+        if sell_signals:
+            logger.info("Assets with SELL signals (priority conversions):")
+            for s in sell_signals:
+                logger.info(f"  - {s['asset']:10s}: ${s['usd_value']:>10.2f} (confidence: {s['confidence']:.1%})")
+        
+        if hold_signals:
+            logger.info("\nAssets with HOLD signals (convert if BUY is much stronger):")
+            for h in hold_signals:
+                logger.info(f"  - {h['asset']:10s}: ${h['usd_value']:>10.2f} (confidence: {h.get('confidence', 0):.1%})")
         
         logger.info("\nTop BUY opportunities:")
         for b in buy_opportunities[:5]:
@@ -963,11 +266,16 @@ class TradingBot:
         
         logger.info("=" * 80 + "\n")
         
-        # Convert each SELL signal into the top BUY opportunity
-        conversions_made = 0
+        # Conversion threshold: HOLD signals require BUY to be 20% more confident
+        confidence_threshold = 0.20
         
+        # Convert each holding into the top BUY opportunities
+        conversions_made = 0
+        buy_index = 0
+        
+        # Process SELL signals first (priority)
         for sell in sell_signals:
-            if conversions_made >= len(buy_opportunities):
+            if buy_index >= len(buy_opportunities):
                 logger.info(f"All BUY opportunities used, stopping conversions")
                 break
             
@@ -980,99 +288,150 @@ class TradingBot:
                 continue
             
             # Get the next BUY opportunity
-            buy_opp = buy_opportunities[conversions_made]
+            buy_opp = buy_opportunities[buy_index]
             product_id = buy_opp['product_id']
             to_asset = product_id.split('-')[0]  # Extract base currency
             
             # Skip if trying to convert to same asset
             if from_asset == to_asset:
                 logger.info(f"Skipping conversion: {from_asset} to {to_asset} (same asset)")
+                buy_index += 1
                 continue
             
-            logger.info(f"[CONVERT] {from_asset} -> {to_asset}")
+            logger.info(f"[CONVERT SELL] {from_asset} -> {to_asset}")
             logger.info(f"   Selling: {from_asset} (${sell['usd_value']:.2f}, SELL confidence: {sell['confidence']:.1%})")
             logger.info(f"   Buying: {to_asset} (BUY confidence: {buy_opp['confidence']:.1%})")
             
+            # Market sell to USDC to provide buying power
             try:
-                # Try direct conversion first
-                result = self.api.convert_crypto(
-                    from_asset=from_asset,
-                    to_asset=to_asset,
-                    amount=str(from_balance)
+                logger.info(f"Market selling {from_asset} to USDC for buying power")
+                
+                # Determine the product ID (ETH-USDC, BTC-USDC, etc.)
+                sell_product_id = f"{from_asset}-USDC"
+                
+                # Place market sell order directly via API
+                sell_result = self.api.place_market_order(
+                    product_id=sell_product_id,
+                    side='SELL',
+                    size=float(from_balance)
                 )
                 
-                if result:
-                    logger.info(f"[SUCCESS] Direct conversion complete!")
-                    logger.info(f"   Traded: {result['from_amount']} {result['from_currency']}")
-                    logger.info(f"   Received: {result['to_amount']} {result['to_currency']}")
-                    logger.info(f"   Rate: {result['exchange_rate']}")
-                    logger.info(f"   Status: {result['status']}")
+                if sell_result and sell_result.get('success'):
+                    logger.info(f"[SUCCESS] Market sold {from_asset} for USDC")
+                    logger.info(f"   Order ID: {sell_result.get('order_id')}")
+                    logger.info(f"   Bot will use this USDC to buy {to_asset} in trading cycle")
                     
                     conversions_made += 1
+                    buy_index += 1
                     
                     # Log to trade history
                     self._log_trade_history({
                         'timestamp': datetime.now(UTC).isoformat(),
-                        'action': 'CONVERT',
+                        'action': 'MARKET_SELL_TO_USDC',
+                        'product_id': sell_product_id,
                         'from_asset': from_asset,
-                        'to_asset': to_asset,
-                        'from_amount': result['from_amount'],
-                        'to_amount': result['to_amount'],
-                        'exchange_rate': result['exchange_rate'],
+                        'amount': str(from_balance),
                         'sell_confidence': sell['confidence'],
-                        'buy_confidence': buy_opp['confidence'],
-                        'trade_id': result['trade_id']
+                        'reason': f'Convert SELL to USDC for buying {to_asset}',
+                        'order_id': sell_result.get('order_id', 'N/A')
+                    })
+                    
+                    # Rate limiting between orders
+                    time.sleep(2)
+                    continue
+                else:
+                    logger.error(f"[FAILED] Could not market sell {from_asset} to USDC")
+                    
+            except Exception as e:
+                logger.error(f"[ERROR] Market sell error {from_asset} -> USDC: {e}")
+            
+            # Rate limiting between conversions
+            time.sleep(1)
+            buy_index += 1
+        
+        # Process HOLD signals - only convert if BUY confidence is significantly better
+        logger.info("\n--- Processing HOLD signals (require 20% better BUY confidence) ---\n")
+        
+        for hold in hold_signals:
+            if buy_index >= len(buy_opportunities):
+                logger.info(f"All BUY opportunities used, stopping conversions")
+                break
+            
+            from_asset = hold['asset']
+            from_balance = hold.get('balance', Decimal('0'))
+            hold_confidence = hold.get('confidence', 0)
+            
+            # Skip if balance is 0 or invalid
+            if from_balance <= 0:
+                logger.warning(f"Skipping {from_asset}: zero or invalid balance ({from_balance})")
+                continue
+            
+            # Get the next BUY opportunity
+            buy_opp = buy_opportunities[buy_index]
+            product_id = buy_opp['product_id']
+            to_asset = product_id.split('-')[0]
+            buy_confidence = buy_opp['confidence']
+            
+            # Skip if trying to convert to same asset
+            if from_asset == to_asset:
+                logger.info(f"Skipping conversion: {from_asset} to {to_asset} (same asset)")
+                buy_index += 1
+                continue
+            
+            # Check if BUY is significantly better than HOLD
+            confidence_diff = buy_confidence - hold_confidence
+            
+            if confidence_diff < confidence_threshold:
+                logger.info(f"[SKIP HOLD] {from_asset} (conf: {hold_confidence:.1%}) -> {to_asset} (conf: {buy_confidence:.1%})")
+                logger.info(f"   Reason: BUY not strong enough (diff: {confidence_diff:.1%}, need: {confidence_threshold:.1%})")
+                buy_index += 1
+                continue
+            
+            logger.info(f"[CONVERT HOLD] {from_asset} -> {to_asset}")
+            logger.info(f"   From: {from_asset} (${hold['usd_value']:.2f}, HOLD confidence: {hold_confidence:.1%})")
+            logger.info(f"   To: {to_asset} (BUY confidence: {buy_confidence:.1%})")
+            logger.info(f"   Improvement: {confidence_diff:.1%}")
+            
+            # Market sell to USDC to provide buying power
+            try:
+                logger.info(f"Market selling {from_asset} to USDC for buying power")
+                
+                sell_product_id = f"{from_asset}-USDC"
+                
+                sell_result = self.api.place_market_order(
+                    product_id=sell_product_id,
+                    side='SELL',
+                    size=float(from_balance)
+                )
+                
+                if sell_result and sell_result.get('success'):
+                    logger.info(f"[SUCCESS] Market sold {from_asset} for USDC")
+                    logger.info(f"   Order ID: {sell_result.get('order_id')}")
+                    logger.info(f"   Bot will use this USDC to buy {to_asset} in trading cycle")
+                    
+                    conversions_made += 1
+                    
+                    self._log_trade_history({
+                        'timestamp': datetime.now(UTC).isoformat(),
+                        'action': 'MARKET_SELL_HOLD_TO_USDC',
+                        'product_id': sell_product_id,
+                        'from_asset': from_asset,
+                        'amount': str(from_balance),
+                        'hold_confidence': hold_confidence,
+                        'buy_confidence': buy_confidence,
+                        'confidence_improvement': confidence_diff,
+                        'reason': f'Convert HOLD to USDC for buying {to_asset}',
+                        'order_id': sell_result.get('order_id', 'N/A')
                     })
                 else:
-                    logger.warning(f"[FALLBACK] Direct conversion not supported, using USDC intermediate")
-                    # Fall back to two-step conversion via USDC
-                    # Step 1: Convert from_asset to USDC
-                    usdc_result = self.api.convert_crypto(
-                        from_asset=from_asset,
-                        to_asset='USDC',
-                        amount=str(from_balance)
-                    )
-                    
-                    if usdc_result:
-                        logger.info(f"   Step 1: {from_asset} -> USDC successful ({usdc_result['to_amount']} USDC)")
-                        
-                        # Step 2: Convert USDC to to_asset
-                        time.sleep(1)  # Rate limiting
-                        
-                        final_result = self.api.convert_crypto(
-                            from_asset='USDC',
-                            to_asset=to_asset,
-                            amount=usdc_result['to_amount']
-                        )
-                        
-                        if final_result:
-                            logger.info(f"[SUCCESS] Two-step conversion complete!")
-                            logger.info(f"   Total: {from_asset} -> {final_result['to_amount']} {to_asset}")
-                            
-                            conversions_made += 1
-                            
-                            # Log to trade history
-                            self._log_trade_history({
-                                'timestamp': datetime.now(UTC).isoformat(),
-                                'action': 'CONVERT_2STEP',
-                                'from_asset': from_asset,
-                                'to_asset': to_asset,
-                                'from_amount': str(from_balance),
-                                'intermediate_usdc': usdc_result['to_amount'],
-                                'to_amount': final_result['to_amount'],
-                                'sell_confidence': sell['confidence'],
-                                'buy_confidence': buy_opp['confidence']
-                            })
-                        else:
-                            logger.error(f"[FAILED] Step 2 failed: USDC -> {to_asset}")
-                    else:
-                        logger.error(f"[FAILED] Step 1 failed: {from_asset} -> USDC")
+                    logger.error(f"[FAILED] Could not market sell {from_asset} to USDC")
                     
             except Exception as e:
                 logger.error(f"[ERROR] Conversion error {from_asset} -> {to_asset}: {e}")
             
             # Rate limiting between conversions
             time.sleep(1)
+            buy_index += 1
         
         if conversions_made > 0:
             logger.info("\n" + "=" * 80)
@@ -1195,7 +554,7 @@ class TradingBot:
                 all_buy_signals = []  # Track ALL BUY signals for top 3 logging
                 
                 for future in as_completed(futures):
-                    if shutdown_requested:
+                    if self._shutdown_event.is_set():
                         logger.info("Shutdown requested, stopping scan...")
                         break
                     
@@ -1221,7 +580,6 @@ class TradingBot:
             logger.info(f"Scan complete: Found {len(opportunities)} opportunities above {min_confidence:.0%} confidence")
             if len(all_buy_signals) > 0:
                 logger.info(f"(Total BUY signals including below threshold: {len(all_buy_signals)})")
-
             
         except Exception as e:
             logger.error(f"Error in product scan: {e}", exc_info=True)
@@ -1388,7 +746,6 @@ class TradingBot:
                             
                             position_metadata = position.get('metadata', {})
                             if isinstance(position_metadata, str):
-                                import json
                                 position_metadata = json.loads(position_metadata)
                             
                             exit_reason = 'unknown_exit'
@@ -1479,9 +836,9 @@ class TradingBot:
             logger.error(f"Error in _check_open_orders: {e}", exc_info=True)
     
     def run(self):
-        """Main trading loop."""
-        global shutdown_requested
-        
+        # Set up signal handlers
+        signal_module.signal(signal_module.SIGINT, self._signal_handler)
+        signal_module.signal(signal_module.SIGTERM, self._signal_handler)
         # Get portfolio ID
         self.portfolio_id = self.api.get_portfolio_id()
         if not self.portfolio_id:
@@ -1512,7 +869,7 @@ class TradingBot:
         cycle_count = 0
         last_fee_check = datetime.now(UTC).date()
         
-        while not shutdown_requested:
+        while not self._shutdown_event.is_set():
             try:
                 cycle_count += 1
                 logger.info("")
@@ -1555,7 +912,7 @@ class TradingBot:
                     time.sleep(loop_sleep)
                     continue
                 
-                # Get open positions and check stop loss/take profit
+                # Get open positions and check for signal-confirmed profit/loss targets
                 open_positions = self.db.get_open_positions()
                 logger.info(f"Open Positions: {len(open_positions)}")
                 
@@ -1567,30 +924,91 @@ class TradingBot:
                         # Update position price in DB for PnL tracking (all modes)
                         self.db.update_position(product_id, current_price=float(current_price))
                         
-                        # --- REFACTORED EXIT LOGIC ---
-                        # Paper trading MUST poll for SL/TP as it has no real exchange orders
-                        if self.paper_trading:
-                            # Check if should close based on polling
-                            should_close, reason = self.risk_manager.should_close_position(
-                                position, current_price
-                            )
+                        # --- SIGNAL-CONFIRMED PROFIT/LOSS EXIT STRATEGY ---
+                        # Calculate cost basis from all BUY fills (includes fees)
+                        cost_basis = self.api.calculate_cost_basis(product_id)
+                        
+                        if cost_basis:
+                            # Calculate profit/loss percentage
+                            profit_pct = ((current_price - cost_basis) / cost_basis) * 100
                             
-                            if should_close:
-                                logger.info(f"[PAPER] Closing position {product_id}: {reason}")
-                                self.execute_sell_order(product_id, position, reason)
+                            # Get current signal for this position
+                            try:
+                                granularity = self.config.get('trading.candle_granularity', 'FIFTEEN_MINUTE')
+                                periods = self.config.get('trading.candle_periods_for_analysis', 200)
+                                df = self.api.get_historical_data(product_id, granularity, periods)
+                                
+                                if not df.empty and len(df) >= 50:
+                                    signal = self.strategy.analyze(df, product_id)
+                                    current_signal = signal.action
+                                    signal_confidence = signal.confidence
+                                    
+                                    logger.info(f"{product_id}: Current=${current_price:.6f}, "
+                                               f"Cost Basis=${cost_basis:.6f}, "
+                                               f"Profit={profit_pct:.2f}%, "
+                                               f"Signal={current_signal} ({signal_confidence:.1%})")
+                                    
+                                    # PROFIT EXIT: +5% with HOLD or SELL signal (NOT BUY)
+                                    if profit_pct >= 5.0 and current_signal in ['HOLD', 'SELL']:
+                                        reason = f"5% PROFIT + {current_signal} SIGNAL ({profit_pct:.2f}%, conf={signal_confidence:.1%})"
+                                        logger.info(f"[PROFIT EXIT] {product_id}: {reason}")
+                                        self.execute_sell_order(product_id, position, reason)
+                                        continue
+                                    
+                                    # PROFIT TARGET REACHED BUT BUY SIGNAL - STAY IN POSITION
+                                    elif profit_pct >= 5.0 and current_signal == 'BUY':
+                                        logger.info(f"[HOLD] {product_id}: 5% profit reached but BUY signal active - staying in position")
+                                    
+                                    # LOSS EXIT: -2% with strong SELL signal
+                                    elif profit_pct <= -2.0 and current_signal == 'SELL' and signal_confidence >= 0.6:
+                                        reason = f"2% LOSS + STRONG SELL SIGNAL ({profit_pct:.2f}%, conf={signal_confidence:.1%})"
+                                        logger.warning(f"[LOSS EXIT] {product_id}: {reason}")
+                                        self.execute_sell_order(product_id, position, reason)
+                                        continue
+                                    
+                                    # LOSS WARNING BUT NOT SELLING
+                                    elif profit_pct <= -2.0:
+                                        logger.warning(f"[LOSS WARNING] {product_id}: {profit_pct:.2f}% loss but {current_signal} signal - holding")
+                                    
+                                else:
+                                    logger.warning(f"{product_id}: Insufficient data for signal analysis")
+                                    
+                            except Exception as e:
+                                logger.error(f"{product_id}: Error getting current signal: {e}")
                             
-                            # Update trailing stop if enabled
-                            elif self.risk_manager.use_trailing_stop:
-                                new_stop = self.risk_manager.update_trailing_stop(
+                            # Optional: Paper trading fallback for stop-loss
+                            if self.paper_trading:
+                                should_close, reason = self.risk_manager.should_close_position(
                                     position, current_price
                                 )
-                                if new_stop:
-                                    self.db.update_position(product_id, stop_loss=float(new_stop))
+                                
+                                if should_close:
+                                    logger.info(f"[PAPER] Closing position {product_id}: {reason}")
+                                    self.execute_sell_order(product_id, position, reason)
+                                
+                                # Update trailing stop if enabled
+                                elif self.risk_manager.use_trailing_stop:
+                                    new_stop = self.risk_manager.update_trailing_stop(
+                                        position, current_price
+                                    )
+                                    if new_stop:
+                                        self.db.update_position(product_id, stop_loss=float(new_stop))
+                        else:
+                            logger.warning(f"{product_id}: Could not calculate cost basis, "
+                                         f"falling back to entry_price from DB")
+                            # Fallback to old logic if cost basis calculation fails
+                            if self.paper_trading:
+                                should_close, reason = self.risk_manager.should_close_position(
+                                    position, current_price
+                                )
+                                
+                                if should_close:
+                                    logger.info(f"[PAPER] Closing position {product_id}: {reason}")
+                                    self.execute_sell_order(product_id, position, reason)
                         
-                        # In live mode, SL/TP exits are handled by _check_open_orders()
-                        # which reacts to FILLED events from exchange's native orders.
-                        # This eliminates the race condition between bot polling and exchange execution.
-                        # --- END REFACTORED EXIT LOGIC ---
+                        # In live mode, signal-confirmed exits are handled here
+                        # SL/TP exits are handled by _check_open_orders() for exchange orders
+                        # --- END SIGNAL-CONFIRMED PROFIT/LOSS EXIT STRATEGY ---
                 
                 # Run full market scan every cycle
                 logger.info("=" * 80)
@@ -1600,20 +1018,38 @@ class TradingBot:
                 best_opportunities = []
                 
                 try:
-                    # First, analyze current holdings and get SELL signals
-                    sell_signals = self._analyze_current_holdings(balances)
+                    # Get ALL balances (low threshold to capture everything)
+                    # analyze_current_holdings will filter to $10+ minimum
+                    all_balances = self.api.get_account_balances(
+                        self.portfolio_id,
+                        min_usd_equivalent=Decimal('0.01')
+                    )
+                    
+                    # Analyze current holdings and get SELL/HOLD signals
+                    # (automatically filters to $10+ positions)
+                    holding_signals = self.market_scanner.analyze_current_holdings(all_balances, self._shutdown_event)
                     
                     # Then scan all products for new opportunities
-                    best_opportunities = self._scan_all_products()
+                    best_opportunities = self.market_scanner.scan_all_products(self._shutdown_event)
                     
-                    # AUTO-CONVERT: If we have SELL signals and BUY opportunities, convert directly
-                    if sell_signals and best_opportunities:
-                        logger.info("=" * 80)
-                        logger.info(f"AUTO-CONVERT: {len(sell_signals)} assets to sell, {len(best_opportunities)} BUY opportunities")
-                        logger.info("=" * 80)
+                    # DEBUG: Log what we got
+                    logger.info(f"DEBUG: holding_signals type: {type(holding_signals)}, value: {holding_signals}")
+                    logger.info(f"DEBUG: best_opportunities count: {len(best_opportunities) if best_opportunities else 0}")
+                    
+                    # AUTO-CONVERT: If we have holdings and BUY opportunities, convert weak to strong
+                    if holding_signals and best_opportunities:
+                        sell_signals = holding_signals.get('sell', [])
+                        hold_signals = holding_signals.get('hold', [])
                         
-                        # Convert weak holdings into strong opportunities
-                        self._auto_convert_holdings(sell_signals, best_opportunities)
+                        logger.info(f"DEBUG: sell_signals count: {len(sell_signals)}, hold_signals count: {len(hold_signals)}")
+                        
+                        if sell_signals or hold_signals:
+                            logger.info("=" * 80)
+                            logger.info(f"AUTO-CONVERT: {len(sell_signals)} SELL + {len(hold_signals)} HOLD assets, {len(best_opportunities)} BUY opportunities")
+                            logger.info("=" * 80)
+                            
+                            # Convert weak holdings into strong opportunities
+                            self._auto_convert_holdings(sell_signals, hold_signals, best_opportunities)
                     
                     if best_opportunities:
                         logger.info(f"Found {len(best_opportunities)} strong opportunities:")
@@ -1644,33 +1080,29 @@ class TradingBot:
                     
                     logger.info(f"Analyzing top {len(top_products)} opportunities for potential trades...")
                     
-                    # Parallel analysis of top opportunities
-                    with ThreadPoolExecutor(max_workers=3) as executor:
-                        futures = {}
+                    # Process top opportunities sequentially to avoid race conditions
+                    for opp in best_opportunities[:10]:
+                        if self._shutdown_event.is_set():
+                            break
                         
-                        for opp in best_opportunities[:10]:
+                        try:
                             product_id = opp['product_id']
-                            future = executor.submit(
-                                self._analyze_product,
-                                product_id,
-                                balances,
-                                product_details
-                            )
-                            futures[future] = product_id
-                        
-                        # Process results
-                        for future in as_completed(futures):
-                            if shutdown_requested:
-                                break
+                            signal_type = opp['signal']
                             
-                            try:
-                                result = future.result()
+                            if signal_type == 'BUY':
+                                # Execute buy order through TradeExecutor
+                                result = self.trade_executor.execute_buy_order(
+                                    product_id=product_id,
+                                    balances=balances,
+                                    product_details=product_details.get(product_id),
+                                    signal_metadata=opp
+                                )
+                                
                                 if result:
-                                    # A trade was executed, break to restart cycle
                                     logger.info("Trade executed, restarting cycle...")
                                     break
-                            except Exception as e:
-                                logger.error(f"Error in analysis: {e}", exc_info=True)
+                        except Exception as e:
+                            logger.error(f"Error executing trade for {product_id}: {e}", exc_info=True)
                 else:
                     logger.info("No opportunities to analyze for trades.")
                 
@@ -1693,6 +1125,7 @@ class TradingBot:
                 
             except KeyboardInterrupt:
                 logger.info("Keyboard interrupt received")
+                self._shutdown_event.set()
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
@@ -1700,78 +1133,40 @@ class TradingBot:
         
         # Cleanup
         self._shutdown()
-    
-    def _analyze_product(
+
+    def _process_buy_opportunity(
         self,
-        product_id: str,
+        opportunity: Dict,
         balances: Dict,
         product_details: Dict
     ) -> bool:
         """
-        Analyze a single product for trading signals.
-        
+        Processes a single buy opportunity.
+
         Returns:
             True if a trade was executed
         """
-        try:
-            # Get historical data
-            granularity = self.config.get('trading.candle_granularity', 'FIVE_MINUTE')
-            periods = self.config.get('trading.candle_periods_for_analysis', 100)
-            
-            df = self.api.get_historical_data(product_id, granularity, periods)
-            
-            if df.empty:
-                return False
-            
-            # Get trading signal
-            signal = self.strategy.analyze(df, product_id)
-            
-            if signal.action == 'HOLD':
-                return False
-            
-            # Check minimum confidence threshold
-            min_confidence = self.config.get('trading.min_signal_confidence', 0.5)
-            
-            logger.info(f"Signal for {product_id}: {signal.action} (confidence: {signal.confidence:.2f})")
-            
-            if signal.confidence < min_confidence:
-                logger.info(f"Signal confidence {signal.confidence:.2f} below threshold {min_confidence:.2f}, skipping")
-                return False
-            
-            # Execute based on signal
-            if signal.action == 'BUY':
-                base_currency = product_id.split('-')[0]
-                
-                # Check if we already have a position
-                existing_position = self.db.get_position(product_id)
-                if existing_position:
-                    logger.info(f"Already have position in {product_id}")
-                    return False
-                
-                if base_currency not in balances:
-                    self.execute_buy_order(
-                        product_id,
-                        balances,
-                        product_details,
-                        signal.metadata
-                    )
-                    return True
-                else:
-                    logger.info(f"Already holding {base_currency}, skipping buy")
-            
-            elif signal.action == 'SELL':
-                # Check if we have a position
-                position = self.db.get_position(product_id)
-                if position:
-                    self.execute_sell_order(product_id, position, 'signal')
-                    return True
-                else:
-                    logger.info(f"No position in {product_id} to sell")
-            
+        product_id = opportunity['product_id']
+        signal_metadata = opportunity['metadata']
+
+        base_currency = product_id.split('-')[0]
+
+        # Check if we already have a position
+        existing_position = self.db.get_position(product_id)
+        if existing_position:
+            logger.info(f"Already have position in {product_id}, skipping.")
             return False
-            
-        except Exception as e:
-            logger.error(f"Error analyzing {product_id}: {e}", exc_info=True)
+
+        if base_currency not in balances:
+            self.trade_executor.execute_buy_order(
+                product_id,
+                balances,
+                product_details,
+                signal_metadata
+            )
+            return True
+        else:
+            logger.info(f"Already holding {base_currency}, skipping buy for {product_id}")
             return False
     
     def _save_performance_snapshot(self, current_equity: Decimal):
@@ -1837,10 +1232,6 @@ def main():
     print()
     print("=" * 80)
     print()
-    
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
     
     # Create and run bot
     try:
