@@ -39,16 +39,23 @@ class BreakoutStrategy(BaseStrategy):
             # Add ADX with explicit column mapping
             adx = df.ta.adx(length=self.adx_length)
             if adx is not None and not adx.empty:
-                df['ADX'] = adx[f'ADX_{self.adx_length}']
+                adx_cols = [c for c in adx.columns if c.startswith('ADX')]
+                if adx_cols:
+                    df['ADX'] = adx[adx_cols[0]]
             
             # Add Bollinger Bands with explicit column mapping
             bbands = df.ta.bbands(length=self.bb_period, std=self.bb_std)
             if bbands is not None and not bbands.empty:
-                df['BB_UPPER'] = bbands[f'BBU_{self.bb_period}_{self.bb_std}']
-                df['BB_MIDDLE'] = bbands[f'BBM_{self.bb_period}_{self.bb_std}']
-                df['BB_LOWER'] = bbands[f'BBL_{self.bb_period}_{self.bb_std}']
-                # Calculate BB_Width using explicit columns
-                df['BB_Width'] = ((df['BB_UPPER'] - df['BB_LOWER']) / df['Close']) * 100
+                lower_cols = [c for c in bbands.columns if c.startswith('BBL')]
+                mid_cols = [c for c in bbands.columns if c.startswith('BBM')]
+                upper_cols = [c for c in bbands.columns if c.startswith('BBU')]
+                
+                if lower_cols and mid_cols and upper_cols:
+                    df['BB_UPPER'] = bbands[upper_cols[0]]
+                    df['BB_MIDDLE'] = bbands[mid_cols[0]]
+                    df['BB_LOWER'] = bbands[lower_cols[0]]
+                    # Calculate BB_Width using explicit columns
+                    df['BB_Width'] = ((df['BB_UPPER'] - df['BB_LOWER']) / df['Close']) * 100
             
             df['Volume_MA'] = df['Volume'].rolling(window=self.bb_period).mean()
             df['Volume_MA_Short'] = df['Volume'].rolling(window=self.volume_ma_short_length).mean()
@@ -174,8 +181,15 @@ class BreakoutStrategy(BaseStrategy):
 
         if buy_confidence > sell_confidence and buy_confidence > 0:
             logger.debug(f"Potential BUY signal for {product_id}: score={buy_score}, confidence={buy_confidence:.2f}")
+            # Include ATR in metadata for dynamic stop-loss calculation
+            atr_value = latest['ATR'] if 'ATR' in df.columns and not pd.isna(latest['ATR']) else None
             return TradingSignal('BUY', confidence=buy_confidence,
-                               metadata={'reasons': buy_reasons, 'score': buy_score})
+                               metadata={
+                                   'reasons': buy_reasons, 
+                                   'score': buy_score,
+                                   'atr': float(atr_value) if atr_value else None,
+                                   'current_price': float(latest['Close'])
+                               })
         
         if sell_confidence > buy_confidence and sell_confidence > 0:
             logger.debug(f"Potential SELL signal for {product_id}: score={sell_score}, confidence={sell_confidence:.2f}")

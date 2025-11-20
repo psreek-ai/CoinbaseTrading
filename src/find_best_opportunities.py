@@ -36,7 +36,7 @@ def analyze_all_products():
     print("COINBASE OPPORTUNITY SCANNER")
     print("=" * 80)
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Strategy: {bot.strategy.name}")
+    print(f"Strategy: {bot.current_strategy_name}")
     print("=" * 80 + "\n")
     
     # Get current holdings

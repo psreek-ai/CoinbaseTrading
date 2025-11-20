@@ -1005,7 +1005,12 @@ class CoinbaseAPI:
             return df
             
         except Exception as e:
-            logger.error(f"Error fetching historical data for {product_id}: {e}")
+            error_str = str(e)
+            if "Connection aborted" in error_str or "RemoteDisconnected" in error_str or "ConnectionError" in error_str:
+                logger.warning(f"Transient network error fetching data for {product_id}: {e}")
+            else:
+                logger.error(f"Error fetching historical data for {product_id}: {e}")
+            
             # Log API error - DISABLED for candles to reduce log volume
             # self._log_api_call(
             #     method='get_candles',

@@ -44,17 +44,27 @@ class MomentumStrategy(BaseStrategy):
             # Add Bollinger Bands with explicit column mapping
             bbands = df.ta.bbands(length=self.bb_period, std=self.bb_std)
             if bbands is not None and not bbands.empty:
-                df['BB_UPPER'] = bbands[f'BBU_{self.bb_period}_{self.bb_std}']
-                df['BB_MIDDLE'] = bbands[f'BBM_{self.bb_period}_{self.bb_std}']
-                df['BB_LOWER'] = bbands[f'BBL_{self.bb_period}_{self.bb_std}']
+                lower_cols = [c for c in bbands.columns if c.startswith('BBL')]
+                mid_cols = [c for c in bbands.columns if c.startswith('BBM')]
+                upper_cols = [c for c in bbands.columns if c.startswith('BBU')]
+                
+                if lower_cols and mid_cols and upper_cols:
+                    df['BB_UPPER'] = bbands[upper_cols[0]]
+                    df['BB_MIDDLE'] = bbands[mid_cols[0]]
+                    df['BB_LOWER'] = bbands[lower_cols[0]]
             
             # Add MACD with explicit column mapping
             macd = df.ta.macd(fast=self.macd_fast, slow=self.macd_slow, 
                              signal=self.macd_signal)
             if macd is not None and not macd.empty:
-                df['MACD'] = macd[f'MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}']
-                df['MACD_SIGNAL'] = macd[f'MACDs_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}']
-                df['MACD_HIST'] = macd[f'MACDh_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}']
+                macd_cols = [c for c in macd.columns if c.startswith('MACD_')]
+                hist_cols = [c for c in macd.columns if c.startswith('MACDh_')]
+                signal_cols = [c for c in macd.columns if c.startswith('MACDs_')]
+                
+                if macd_cols and hist_cols and signal_cols:
+                    df['MACD'] = macd[macd_cols[0]]
+                    df['MACD_SIGNAL'] = macd[signal_cols[0]]
+                    df['MACD_HIST'] = macd[hist_cols[0]]
             
             # Add RSI with explicit column mapping
             rsi = df.ta.rsi(length=self.rsi_period)
@@ -64,15 +74,38 @@ class MomentumStrategy(BaseStrategy):
             # Add ADX with explicit column mapping
             adx = df.ta.adx(length=self.adx_length)
             if adx is not None and not adx.empty:
-                df['ADX'] = adx[f'ADX_{self.adx_length}']
-                if f'DMP_{self.adx_length}' in adx.columns:
-                    df['DI_PLUS'] = adx[f'DMP_{self.adx_length}']
-                if f'DMN_{self.adx_length}' in adx.columns:
-                    df['DI_MINUS'] = adx[f'DMN_{self.adx_length}']
+                adx_cols = [c for c in adx.columns if c.startswith('ADX')]
+                if adx_cols:
+                    df['ADX'] = adx[adx_cols[0]]
+                
+                dmp_cols = [c for c in adx.columns if c.startswith('DMP')]
+                dmn_cols = [c for c in adx.columns if c.startswith('DMN')]
+                if dmp_cols:
+                    df['DI_PLUS'] = adx[dmp_cols[0]]
+                if dmn_cols:
+                    df['DI_MINUS'] = adx[dmn_cols[0]]
+            
+            # Add ATR for dynamic stop-loss calculation
+            df['ATR'] = df.ta.atr(length=14)
             
             # Add EMAs
-            df['EMA_FAST'] = df.ta.ema(length=self.ema_fast_length)
-            df['EMA_SLOW'] = df.ta.ema(length=self.ema_slow_length)
+            ema_fast = df.ta.ema(length=self.ema_fast_length)
+            if ema_fast is not None:
+                if isinstance(ema_fast, pd.DataFrame):
+                    ema_cols = [c for c in ema_fast.columns if c.startswith('EMA')]
+                    if ema_cols:
+                        df['EMA_FAST'] = ema_fast[ema_cols[0]]
+                else:
+                    df['EMA_FAST'] = ema_fast
+            
+            ema_slow = df.ta.ema(length=self.ema_slow_length)
+            if ema_slow is not None:
+                if isinstance(ema_slow, pd.DataFrame):
+                    ema_cols = [c for c in ema_slow.columns if c.startswith('EMA')]
+                    if ema_cols:
+                        df['EMA_SLOW'] = ema_slow[ema_cols[0]]
+                else:
+                    df['EMA_SLOW'] = ema_slow
             
             # Add Volume MA
             df['Volume_MA'] = df['Volume'].rolling(window=self.volume_ma_length).mean()
@@ -193,8 +226,15 @@ class MomentumStrategy(BaseStrategy):
         # Determine signal based on confidence comparison
         if buy_confidence > sell_confidence and buy_confidence > 0:
             logger.debug(f"BUY signal for {product_id}: score={buy_score:.1f}/100, confidence={buy_confidence:.1%}")
+            # Include ATR in metadata for dynamic stop-loss calculation
+            atr_value = latest['ATR'] if 'ATR' in df.columns and not pd.isna(latest['ATR']) else None
             return TradingSignal('BUY', confidence=buy_confidence, 
-                               metadata={'reasons': buy_reasons, 'score': buy_score})
+                               metadata={
+                                   'reasons': buy_reasons, 
+                                   'score': buy_score,
+                                   'atr': float(atr_value) if atr_value else None,
+                                   'current_price': float(latest['Close'])
+                               })
         
         if sell_confidence > buy_confidence and sell_confidence > 0:
             logger.debug(f"SELL signal for {product_id}: score={sell_score:.1f}/100, confidence={sell_confidence:.1%}")

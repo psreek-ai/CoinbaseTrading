@@ -18,10 +18,14 @@ from config_loader import get_config
 from database import DatabaseManager
 from api_client import CoinbaseAPI
 from strategies import StrategyFactory
+from strategy_manager import StrategyManager
+from ai_analyst import AIAnalyst
 from risk_management import RiskManager
 from analytics import PerformanceAnalytics
 from trade_executor import TradeExecutor
 from market_scanner import MarketScanner
+from market_regime import MarketRegimeDetector, MarketRegime
+from trade_logger import TradeAnalyticsLogger
 
 class TradingBot:
     
@@ -39,9 +43,14 @@ class TradingBot:
         # Initialize components
         self.db = self._initialize_database()
         self.api = self._initialize_api()
-        self.strategy = self._initialize_strategy()
+        self.strategy_manager = self._initialize_strategy_manager()
+        self.ai_analyst = self._initialize_ai_analyst()
         self.risk_manager = self._initialize_risk_manager()
         self.analytics = self._initialize_analytics()
+        
+        # Initialize analytics logger for strategy experiments
+        self.analytics_logger = TradeAnalyticsLogger()
+        logger.info(f"Analytics logger initialized: {self.analytics_logger.session_file}")
         
         # Initialize new components
         self.trade_executor = TradeExecutor(
@@ -49,13 +58,21 @@ class TradingBot:
             self.db,
             self.risk_manager,
             self.config.get('trading.paper_trading_mode', True),
-            self.config.get('strategies.active_strategy')
+            self.config.get('strategies.active_strategy'),
+            self.analytics_logger
         )
         self.market_scanner = MarketScanner(
             self.api,
-            self.strategy,
-            self.config
+            self.strategy_manager,
+            self.config,
+            self.analytics_logger
         )
+        
+        # Initialize market regime detector
+        regime_config = self.config.get('regime_detection', {})
+        self.regime_detector = MarketRegimeDetector(regime_config)
+        self.current_regime = None
+        self.current_strategy_name = self.config.get('strategies.active_strategy')
 
         # Bot state
         self.portfolio_id = None
@@ -135,17 +152,16 @@ class TradingBot:
         
         return api
     
-    def _initialize_strategy(self) -> object:
-        """Initialize trading strategy."""
-        strategy_name = self.config.get('strategies.active_strategy', 'momentum')
-        strategy_config = self.config.get(f'strategies.{strategy_name}', {})
-        
-        # For hybrid strategy, include all strategy configs
-        if strategy_name == 'hybrid':
-            strategy_config = self.config['strategies']
-        
-        logger.info(f"Initializing {strategy_name} strategy")
-        return StrategyFactory.create_strategy(strategy_name, strategy_config)
+    def _initialize_strategy_manager(self) -> StrategyManager:
+        """Initialize strategy manager."""
+        logger.info("Initializing Strategy Manager")
+        return StrategyManager(self.config)
+
+    def _initialize_ai_analyst(self) -> AIAnalyst:
+        """Initialize AI Analyst."""
+        logger.info("Initializing AI Analyst")
+        ai_config = self.config.get('ai_analysis', {})
+        return AIAnalyst(ai_config)
     
     def _initialize_risk_manager(self) -> RiskManager:
         """Initialize risk manager."""
@@ -158,6 +174,121 @@ class TradingBot:
         logger.info("Initializing performance analytics")
         analytics_config = self.config.get('analytics', {})
         return PerformanceAnalytics(analytics_config, self.db)
+    
+    def _detect_and_switch_strategy(self) -> bool:
+        """
+        Detect market regime and switch strategy if needed.
+        
+        Returns:
+            True if trading should continue, False if trading should be paused
+        """
+        try:
+            # Get reference product for regime analysis
+            reference_product = self.regime_detector.reference_product
+            regime_timeframe = self.regime_detector.regime_timeframe
+            
+            logger.info(f"Analyzing market regime using {reference_product} @ {regime_timeframe}...")
+            
+            # Get data for regime analysis
+            df = self.api.get_historical_data(
+                reference_product,
+                regime_timeframe,
+                periods=100  # Need enough for ADX calculation
+            )
+            
+            if df is None or df.empty:
+                logger.warning(f"Could not get data for {reference_product} - keeping current strategy")
+                return True
+            
+            # Detect regime
+            regime_info = self.regime_detector.detect_regime(df, use_cache=True)
+            self.current_regime = regime_info
+            
+            # Check if trading should be allowed
+            if not self.regime_detector.should_trade(regime_info):
+                logger.warning("Trading paused due to unfavorable market conditions")
+                return False
+            
+            # Get recommended strategy
+            recommended_strategy = self.regime_detector.get_recommended_strategy(regime_info)
+            
+            # Switch strategy if needed
+            if recommended_strategy != self.current_strategy_name:
+                logger.info("=" * 80)
+                logger.info(f"STRATEGY SWITCH: {self.current_strategy_name.upper()} → {recommended_strategy.upper()}")
+                logger.info(f"Reason: Market regime changed to {regime_info['regime'].value.upper()}")
+                logger.info("=" * 80)
+                
+                # Get strategy config
+                strategy_config = self.config.get(f'strategies.{recommended_strategy}', {})
+                
+                # Create new strategy (handled by manager now, just update active name)
+                self.current_strategy_name = recommended_strategy
+                self.config.config['strategies']['active_strategy'] = recommended_strategy
+                
+                # Update market scanner (it reads config)
+                # self.market_scanner.strategy = self.strategy # No longer needed as scanner uses manager
+                
+                # Update trade executor
+                self.trade_executor.strategy_name = recommended_strategy
+                
+                # Log regime change to database
+                try:
+                    self.db.insert_regime_change(regime_info, recommended_strategy)
+                    logger.info("Regime change logged to database")
+                except Exception as db_err:
+                    logger.warning(f"Could not log regime change to database: {db_err}")
+                
+                logger.info(f"Successfully switched to {recommended_strategy} strategy")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in regime detection: {e}", exc_info=True)
+            # On error, continue with current strategy
+            return True
+    
+    def _display_regime_performance(self):
+        """Display performance statistics by market regime"""
+        try:
+            logger.info("")
+            logger.info("=" * 80)
+            logger.info("PERFORMANCE BY MARKET REGIME")
+            logger.info("=" * 80)
+            
+            performance = self.db.get_performance_by_regime()
+            
+            if not performance:
+                logger.info("No regime-based performance data available yet")
+                return
+            
+            # Group by regime
+            by_regime = {}
+            for key, data in performance.items():
+                regime = data['regime']
+                if regime not in by_regime:
+                    by_regime[regime] = []
+                by_regime[regime].append(data)
+            
+            # Display by regime
+            for regime, strategies in by_regime.items():
+                logger.info("")
+                logger.info(f"Regime: {regime.upper()}")
+                logger.info("-" * 80)
+                
+                for strat in strategies:
+                    logger.info(f"  Strategy: {strat['strategy']}")
+                    logger.info(f"    Trades: {strat['trade_count']} | "
+                               f"Win Rate: {strat['win_rate']:.1f}% | "
+                               f"Total PnL: ${strat['total_pnl']:.2f}")
+                    logger.info(f"    Avg PnL: ${strat['avg_pnl']:.2f} | "
+                               f"Max Win: ${strat['max_win']:.2f} | "
+                               f"Max Loss: ${strat['max_loss']:.2f}")
+            
+            logger.info("=" * 80)
+            
+        except Exception as e:
+            logger.error(f"Error displaying regime performance: {e}", exc_info=True)
     
     def _get_total_equity(self, balances: Dict[str, Decimal]) -> Decimal:
         """
@@ -683,7 +814,7 @@ class TradingBot:
                                 'holding_time_seconds': holding_time,
                                 'entry_time': entry_time,
                                 'exit_time': exit_time,
-                                'strategy': position_metadata.get('strategy', self.strategy.name),
+                                'strategy': position_metadata.get('strategy', self.current_strategy_name),
                                 'exit_reason': exit_reason,
                                 'metadata': {'fill_order_id': order_id, 'live_trade': True}
                             })
@@ -768,6 +899,8 @@ class TradingBot:
         
         cycle_count = 0
         last_fee_check = datetime.now(UTC).date()
+        last_ai_analysis = datetime.now(UTC)
+        ai_analysis_interval = self.config.get('ai_analysis.analysis_interval_minutes', 60) * 60
         
         while not self._shutdown_event.is_set():
             try:
@@ -776,6 +909,25 @@ class TradingBot:
                 logger.info("=" * 80)
                 logger.info(f"TRADING CYCLE #{cycle_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 logger.info("=" * 80)
+                
+                # STEP 1: MARKET REGIME DETECTION
+                # Analyze market conditions and switch strategy if needed
+                logger.info("")
+                logger.info("--- MARKET REGIME ANALYSIS ---")
+                should_trade = self._detect_and_switch_strategy()
+                
+                if not should_trade:
+                    logger.warning("Trading paused due to unfavorable market conditions")
+                    logger.info(f"Sleeping for {loop_sleep} seconds...")
+                    time.sleep(loop_sleep)
+                    continue
+                
+                # Log current regime and strategy
+                if self.current_regime:
+                    logger.info(f"Active Strategy: {self.current_strategy_name.upper()} "
+                               f"(Regime: {self.current_regime['regime'].value.upper()}, "
+                               f"ADX: {self.current_regime['adx']:.1f}, "
+                               f"Confidence: {self.current_regime['confidence']:.1%})")
                 
                 # Check daily fees (once per day)
                 current_date = datetime.now(UTC).date()
@@ -786,6 +938,54 @@ class TradingBot:
                         logger.info(f"Today's Fees: ${fee_summary['total_fees']:.2f}, "
                                    f"Volume: ${fee_summary['total_volume']:.2f}")
                     last_fee_check = current_date
+                    
+                    # Display regime performance summary once per day
+                    self._display_regime_performance()
+                
+                # AI ANALYSIS LOOP
+                if (datetime.now(UTC) - last_ai_analysis).total_seconds() > ai_analysis_interval:
+                    logger.info("Running AI Strategy Analysis...")
+                    try:
+                        # Get performance summary from strategy manager
+                        performance_data = self.strategy_manager.get_performance_summary()
+                        
+                        # Get market context (using regime detector data)
+                        market_context = {
+                            'regime': self.current_regime['regime'].value if self.current_regime else 'unknown',
+                            'adx': self.current_regime.get('adx') if self.current_regime else 0,
+                            'volatility': 'high' if self.current_regime and self.current_regime.get('adx', 0) > 25 else 'low'
+                        }
+                        
+                        # Ask AI for recommendation
+                        recommendation = self.ai_analyst.analyze_performance(performance_data, market_context)
+                        
+                        if recommendation:
+                            rec_strategy = recommendation.get('strategy')
+                            confidence = recommendation.get('confidence', 0)
+                            reasoning = recommendation.get('reasoning', '')
+                            
+                            logger.info(f"AI Recommends: {rec_strategy} (Confidence: {confidence:.2f})")
+                            logger.info(f"Reasoning: {reasoning}")
+                            
+                            # Switch if confidence is high enough and different from current
+                            if (rec_strategy != self.current_strategy_name and 
+                                confidence >= self.config.get('ai_analysis.min_confidence', 0.7)):
+                                
+                                logger.info(f"SWITCHING STRATEGY TO {rec_strategy} BASED ON AI RECOMMENDATION")
+                                self.current_strategy_name = rec_strategy
+                                self.config.config['strategies']['active_strategy'] = rec_strategy
+                                self.trade_executor.strategy_name = rec_strategy
+                                
+                                # Log to DB
+                                self.db.insert_regime_change({
+                                    'regime': self.current_regime['regime'] if self.current_regime else 'AI_DECISION',
+                                    'confidence': confidence
+                                }, rec_strategy)
+                                
+                        last_ai_analysis = datetime.now(UTC)
+                        
+                    except Exception as e:
+                        logger.error(f"Error in AI analysis loop: {e}")
                 
                 # CRITICAL: Check status of all open orders (persistent order management)
                 logger.info("Checking open orders status...")
@@ -839,7 +1039,14 @@ class TradingBot:
                                 df = self.api.get_historical_data(product_id, granularity, periods)
                                 
                                 if not df.empty and len(df) >= 50:
-                                    signal = self.strategy.analyze(df, product_id)
+                                    # Use strategy manager to get signal for ACTIVE strategy
+                                    all_signals = self.strategy_manager.get_all_signals(df, product_id)
+                                    signal = all_signals.get(self.current_strategy_name)
+                                    
+                                    if not signal:
+                                        logger.warning(f"No signal from active strategy {self.current_strategy_name}")
+                                        continue
+
                                     current_signal = signal.action
                                     signal_confidence = signal.confidence
                                     
@@ -848,28 +1055,92 @@ class TradingBot:
                                                f"Profit={profit_pct:.2f}%, "
                                                f"Signal={current_signal} ({signal_confidence:.1%})")
                                     
+                                    # Log position update for analytics
+                                    if self.analytics_logger:
+                                        entry_time_str = position.get('opened_at')
+                                        holding_seconds = None
+                                        if entry_time_str:
+                                            try:
+                                                entry_dt = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+                                                holding_seconds = int((datetime.now(UTC) - entry_dt).total_seconds())
+                                            except:
+                                                pass
+                                        
+                                        self.analytics_logger.log_position_update(
+                                            timestamp=datetime.utcnow(),
+                                            product_id=product_id,
+                                            current_price=float(current_price),
+                                            entry_price=float(position.get('entry_price', cost_basis)),
+                                            position_size=float(position.get('base_size', 0)),
+                                            unrealized_pnl=float((current_price - cost_basis) * Decimal(str(position.get('base_size', 0)))),
+                                            unrealized_pnl_pct=profit_pct,
+                                            cost_basis=float(cost_basis),
+                                            holding_time_seconds=holding_seconds,
+                                            stop_loss=position.get('stop_loss'),
+                                            take_profit=position.get('take_profit'),
+                                            current_signal=current_signal,
+                                            current_confidence=signal_confidence
+                                        )
+                                    
+                                    # EMERGENCY EXIT: -2% loss REGARDLESS of signal (hard stop)
+                                    if profit_pct <= -2.0:
+                                        reason = f"EMERGENCY STOP: -2% hard limit ({profit_pct:.2f}%)"
+                                        logger.critical(f"[EMERGENCY EXIT] {product_id}: {reason}")
+                                        
+                                        # Log exit decision
+                                        if self.analytics_logger:
+                                            self.analytics_logger.log_exit_decision(
+                                                timestamp=datetime.utcnow(),
+                                                product_id=product_id,
+                                                decision='exit_emergency',
+                                                current_price=float(current_price),
+                                                entry_price=float(position.get('entry_price', cost_basis)),
+                                                pnl_pct=profit_pct,
+                                                exit_reason=reason,
+                                                emergency_exit=True
+                                            )
+                                        
+                                        self.trade_executor.execute_sell_order(product_id, position, exit_reason='emergency')
+                                        continue
+                                    
                                     # PROFIT EXIT: +5% with HOLD or SELL signal (NOT BUY)
                                     if profit_pct >= 5.0 and current_signal in ['HOLD', 'SELL']:
                                         reason = f"5% PROFIT + {current_signal} SIGNAL ({profit_pct:.2f}%, conf={signal_confidence:.1%})"
                                         logger.info(f"[PROFIT EXIT] {product_id}: {reason}")
+                                        
+                                        # Log exit decision
+                                        if self.analytics_logger:
+                                            self.analytics_logger.log_exit_decision(
+                                                timestamp=datetime.utcnow(),
+                                                product_id=product_id,
+                                                decision='exit_profit',
+                                                current_price=float(current_price),
+                                                entry_price=float(position.get('entry_price', cost_basis)),
+                                                pnl_pct=profit_pct,
+                                                exit_reason=reason,
+                                                signal_data={'signal': current_signal, 'confidence': signal_confidence}
+                                            )
+                                        
                                         self.trade_executor.execute_sell_order(product_id, position, reason)
                                         continue
                                     
                                     # PROFIT TARGET REACHED BUT BUY SIGNAL - STAY IN POSITION
                                     elif profit_pct >= 5.0 and current_signal == 'BUY':
                                         logger.info(f"[HOLD] {product_id}: 5% profit reached but BUY signal active - staying in position")
-                                    
-                                    # LOSS EXIT: -2% with strong SELL signal
-                                    elif profit_pct <= -2.0 and current_signal == 'SELL' and signal_confidence >= 0.6:
-                                        reason = f"2% LOSS + STRONG SELL SIGNAL ({profit_pct:.2f}%, conf={signal_confidence:.1%})"
-                                        logger.warning(f"[LOSS EXIT] {product_id}: {reason}")
-                                        self.trade_executor.execute_sell_order(product_id, position, reason)
-                                        continue
-                                    
-                                    # LOSS WARNING BUT NOT SELLING
-                                    elif profit_pct <= -2.0:
-                                        logger.warning(f"[LOSS WARNING] {product_id}: {profit_pct:.2f}% loss but {current_signal} signal - holding")
-                                    
+                                        
+                                        # Log hold decision
+                                        if self.analytics_logger:
+                                            self.analytics_logger.log_exit_decision(
+                                                timestamp=datetime.utcnow(),
+                                                product_id=product_id,
+                                                decision='hold',
+                                                current_price=float(current_price),
+                                                entry_price=float(position.get('entry_price', cost_basis)),
+                                                pnl_pct=profit_pct,
+                                                exit_reason='profit_target_reached_but_buy_signal_active',
+                                                signal_data={'signal': current_signal, 'confidence': signal_confidence}
+                                            )
+                                
                                 else:
                                     logger.warning(f"{product_id}: Insufficient data for signal analysis")
                                     

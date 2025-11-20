@@ -131,33 +131,54 @@ class RiskManager:
     def calculate_stop_loss_take_profit(
         self,
         entry_price: Decimal,
-        side: str = 'BUY'
+        side: str = 'BUY',
+        atr: float = None
     ) -> Tuple[Decimal, Decimal]:
         """
-        Calculate stop loss and take profit prices.
+        Calculate stop loss and take profit prices using ATR-based dynamic stops.
         
         Args:
             entry_price: Entry price
             side: 'BUY' or 'SELL'
+            atr: Average True Range value for dynamic stop calculation (optional)
             
         Returns:
             Tuple of (stop_loss_price, take_profit_price)
         """
         try:
             if side.upper() == 'BUY':
-                stop_loss = (entry_price * (Decimal('1') - self.default_stop_loss_percent))\
-                            .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+                # Use ATR-based stop if available (1.5x ATR below entry)
+                if atr and atr > 0:
+                    stop_distance = Decimal(str(atr)) * Decimal('1.5')
+                    stop_loss = (entry_price - stop_distance).quantize(
+                        Decimal('0.00000001'), rounding=ROUND_DOWN
+                    )
+                    logger.debug(f"ATR-based stop: entry={entry_price}, ATR={atr}, distance={stop_distance}, stop={stop_loss}")
+                else:
+                    # Fallback to percentage-based stop
+                    stop_loss = (entry_price * (Decimal('1') - self.default_stop_loss_percent))\
+                                .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+                    logger.debug(f"Percentage-based stop: entry={entry_price}, pct={self.default_stop_loss_percent}, stop={stop_loss}")
+                
+                # Keep percentage-based take profit
                 take_profit = (entry_price * (Decimal('1') + self.default_take_profit_percent))\
                              .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
             else:  # SELL
-                stop_loss = (entry_price * (Decimal('1') + self.default_stop_loss_percent))\
-                           .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+                if atr and atr > 0:
+                    stop_distance = Decimal(str(atr)) * Decimal('1.5')
+                    stop_loss = (entry_price + stop_distance).quantize(
+                        Decimal('0.00000001'), rounding=ROUND_DOWN
+                    )
+                else:
+                    stop_loss = (entry_price * (Decimal('1') + self.default_stop_loss_percent))\
+                               .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+                
                 take_profit = (entry_price * (Decimal('1') - self.default_take_profit_percent))\
                              .quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
             
             return stop_loss, take_profit
         except (decimal.InvalidOperation, decimal.Overflow) as e:
-            logger.error(f"Error calculating stop loss/take profit for entry_price={entry_price}, side={side}: {e}")
+            logger.error(f"Error calculating stop loss/take profit for entry_price={entry_price}, side={side}, atr={atr}: {e}")
             # Return simple percentage-based values without quantize
             if side.upper() == 'BUY':
                 stop_loss = entry_price * (Decimal('1') - self.default_stop_loss_percent)

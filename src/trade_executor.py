@@ -19,13 +19,15 @@ class TradeExecutor:
         db: DatabaseManager,
         risk_manager: RiskManager,
         paper_trading: bool,
-        strategy_name: str
+        strategy_name: str,
+        analytics_logger=None
     ):
         self.api = api
         self.db = db
         self.risk_manager = risk_manager
         self.paper_trading = paper_trading
         self.strategy_name = strategy_name
+        self.analytics_logger = analytics_logger
 
     def execute_buy_order(
         self,
@@ -101,14 +103,17 @@ class TradeExecutor:
 
         logger.info(f"Volume flow: {buy_pressure:.1%} buy pressure ({net_pressure})")
 
-        # Require moderate buy pressure for entry
-        if buy_pressure < 0.45:
+        # Require moderate buy pressure for entry (lowered from 45% to 35%)
+        if buy_pressure < 0.35:
             logger.warning(f"Insufficient buy pressure ({buy_pressure:.1%}), skipping entry")
             return
 
-        # Calculate stop loss and take profit
+        # Extract ATR from signal metadata for dynamic stop-loss
+        atr_value = signal_metadata.get('atr')
+        
+        # Calculate stop loss and take profit (with ATR if available)
         stop_loss, take_profit = self.risk_manager.calculate_stop_loss_take_profit(
-            entry_price, side='BUY'
+            entry_price, side='BUY', atr=atr_value
         )
 
         # Calculate position size
@@ -214,6 +219,27 @@ class TradeExecutor:
         logger.info(f"Stop Loss: {stop_loss} | Take Profit: {take_profit}")
         logger.info(f"Position Value: ${position_value:.2f}")
         logger.info("=" * 60)
+        
+        # Log entry decision for analytics
+        if self.analytics_logger:
+            self.analytics_logger.log_entry_decision(
+                timestamp=datetime.utcnow(),
+                product_id=product_id,
+                decision='execute',
+                signal_data=signal_metadata,
+                balance=float(total_equity),
+                risk_checks={
+                    'position_value': float(position_value),
+                    'risk_percent': self.risk_manager.risk_percent_per_trade,
+                    'max_position_pct': self.risk_manager.max_position_size_percent
+                },
+                spread_analysis=spread_analysis if 'spread_analysis' in locals() else None,
+                volume_analysis={
+                    'buy_pressure': float(buy_pressure),
+                    'net_pressure': net_pressure
+                },
+                position_sizing=sizing_metadata
+            )
 
         if self.paper_trading:
             # Paper trading: Simulate limit order with post-only
@@ -269,6 +295,38 @@ class TradeExecutor:
                     'bracket_order': True  # Simulated bracket order
                 }
             })
+            
+            # Log order placement for analytics
+            if self.analytics_logger:
+                self.analytics_logger.log_order_placement(
+                    timestamp=datetime.utcnow(),
+                    product_id=product_id,
+                    order_id=order_id,
+                    side='BUY',
+                    order_type='limit_gtc_post_only',
+                    size=actual_size,
+                    price=float(actual_entry_price),
+                    stop_loss=float(stop_loss) if stop_loss else None,
+                    take_profit=float(take_profit) if take_profit else None,
+                    post_only=True,
+                    fees_expected=float(preview['commission_total']),
+                    slippage_expected=float(slippage_percent),
+                    metadata=signal_metadata
+                )
+                
+                # Immediately log fill for paper trading
+                self.analytics_logger.log_order_fill(
+                    timestamp=datetime.utcnow(),
+                    product_id=product_id,
+                    order_id=order_id,
+                    side='BUY',
+                    filled_size=actual_size,
+                    filled_price=float(actual_entry_price),
+                    actual_fees=float(preview['commission_total']),
+                    actual_slippage=float(slippage_percent),
+                    fill_time_seconds=0
+                )
+
 
             # Start WebSocket for this product to monitor in real-time
             try:
@@ -573,9 +631,11 @@ class TradeExecutor:
 
             logger.info(f"[PAPER] SELL order executed: {order_id}")
         else:
-            # Live trading: Place market sell order
-            logger.info("Placing live market SELL order...")
-
+            # Live trading: Determine order type based on exit reason
+            # Use MARKET order ONLY for stop-loss (speed critical)
+            # Use LIMIT order for profit-taking (earn maker rebates)
+            is_stop_loss_exit = exit_reason.lower() in ['stop_loss', 'stop', 'emergency']
+            
             # First, cancel any open SL/TP orders for this position
             metadata = position.get('metadata', {})
             stop_order_id = metadata.get('stop_order_id')
@@ -600,48 +660,160 @@ class TradeExecutor:
                 except Exception as e:
                     logger.warning(f"Could not cancel take-profit order {tp_order_id}: {e}")
 
-            # Place market sell order
-            sell_order = self.api.place_market_order(
-                product_id=product_id,
-                side='SELL',
-                size=float(position_size)
-            )
+            if is_stop_loss_exit:
+                # STOP-LOSS EXIT: Use market order for immediate execution
+                logger.info("Placing live MARKET SELL order (stop-loss exit - speed critical)...")
+                
+                sell_order = self.api.place_market_order(
+                    product_id=product_id,
+                    side='SELL',
+                    size=float(position_size)
+                )
 
-            if not sell_order:
-                logger.error(f"Failed to place market SELL order for {product_id}")
-                return
+                if not sell_order:
+                    logger.error(f"Failed to place market SELL order for {product_id}")
+                    return
 
-            order_id = sell_order['order_id']
-            logger.info(f"Market SELL order placed: {order_id}")
+                order_id = sell_order['order_id']
+                order_type = 'market'
+                logger.info(f"Market SELL order placed: {order_id}")
 
-            # Wait for fill confirmation (market orders fill quickly)
-            import time
-            filled = False
-            actual_fill_price = current_price
-            actual_commission = Decimal('0')
+                # Wait for fill confirmation (market orders fill quickly)
+                import time
+                filled = False
+                actual_fill_price = current_price
+                actual_commission = Decimal('0')
 
-            for i in range(10):  # Wait up to 10 seconds for market order fill
-                time.sleep(1)
-                order_status = self.api.get_order_status(order_id)
-                if order_status and order_status['status'] == 'FILLED':
-                    filled = True
-                    logger.info(f"Market SELL order filled: {order_id}")
+                for i in range(10):  # Wait up to 10 seconds for market order fill
+                    time.sleep(1)
+                    order_status = self.api.get_order_status(order_id)
+                    if order_status and order_status['status'] == 'FILLED':
+                        filled = True
+                        logger.info(f"Market SELL order filled: {order_id}")
 
-                    # Get actual fill details
-                    fills = self.api.get_fills(order_id=order_id)
-                    if fills:
-                        total_size = sum(Decimal(str(f['size'])) for f in fills)
-                        weighted_price = sum(Decimal(str(f['price'])) * Decimal(str(f['size'])) for f in fills)
-                        actual_fill_price = weighted_price / total_size if total_size > 0 else current_price
-                        actual_commission = sum(Decimal(str(f['commission'])) for f in fills)
+                        # Get actual fill details
+                        fills = self.api.get_fills(order_id=order_id)
+                        if fills:
+                            total_size = sum(Decimal(str(f['size'])) for f in fills)
+                            weighted_price = sum(Decimal(str(f['price'])) * Decimal(str(f['size'])) for f in fills)
+                            actual_fill_price = weighted_price / total_size if total_size > 0 else current_price
+                            actual_commission = sum(Decimal(str(f['commission'])) for f in fills)
 
-                        logger.info(f"Fill price: {actual_fill_price}, Commission: {actual_commission}")
-                    break
+                            logger.info(f"Fill price: {actual_fill_price}, Commission: {actual_commission}")
+                        break
 
-            if not filled:
-                logger.error(f"Market SELL order did not fill within 10 seconds: {order_id}")
-                logger.error("CRITICAL: Position may still be open on exchange but bot cannot confirm!")
-                return
+                if not filled:
+                    logger.error(f"Market SELL order did not fill within 10 seconds: {order_id}")
+                    logger.error("CRITICAL: Position may still be open on exchange but bot cannot confirm!")
+                    return
+            
+            else:
+                # PROFIT-TAKING EXIT: Use limit order at best bid to earn maker rebates (+0.4%)
+                logger.info("Placing live LIMIT SELL order at best bid (earning maker rebates +0.4%)...")
+                
+                # Get best bid price for optimal limit order placement
+                bid_ask_data = self.api.get_best_bid_ask([product_id])
+                best_bid = None
+                
+                if bid_ask_data and product_id in bid_ask_data:
+                    best_bid = bid_ask_data[product_id].get('best_bid')
+                    spread_pct = bid_ask_data[product_id].get('spread_pct', 0)
+                    logger.info(f"Best bid: {best_bid}, Spread: {spread_pct:.3f}%")
+                
+                if not best_bid:
+                    logger.warning(f"Could not get best bid for {product_id}, using current price")
+                    best_bid = current_price
+                
+                # Place limit sell order at best bid (immediate fill as maker)
+                sell_order = self.api.place_limit_order_gtc(
+                    product_id=product_id,
+                    side='SELL',
+                    price=float(best_bid),
+                    size=float(position_size),
+                    post_only=False  # Allow immediate fill if bid is available
+                )
+
+                if not sell_order:
+                    logger.error(f"Failed to place limit SELL order for {product_id}")
+                    return
+
+                order_id = sell_order['order_id']
+                order_type = 'limit_gtc'
+                logger.info(f"Limit SELL order placed at {best_bid}: {order_id}")
+
+                # Monitor for fill (limit orders may take longer)
+                import time
+                filled = False
+                actual_fill_price = best_bid
+                actual_commission = Decimal('0')
+                
+                timeout = 30  # 30 second timeout for limit sell
+                start_time = time.time()
+                
+                while time.time() - start_time < timeout:
+                    time.sleep(1)
+                    order_status = self.api.get_order_status(order_id)
+                    if order_status and order_status['status'] == 'FILLED':
+                        filled = True
+                        logger.info(f"Limit SELL order filled: {order_id}")
+
+                        # Get actual fill details
+                        fills = self.api.get_fills(order_id=order_id)
+                        if fills:
+                            total_size = sum(Decimal(str(f['size'])) for f in fills)
+                            weighted_price = sum(Decimal(str(f['price'])) * Decimal(str(f['size'])) for f in fills)
+                            actual_fill_price = weighted_price / total_size if total_size > 0 else best_bid
+                            actual_commission = sum(Decimal(str(f['commission'])) for f in fills)
+
+                            logger.info(f"Fill price: {actual_fill_price}, Commission: {actual_commission}")
+                        break
+
+                if not filled:
+                    logger.warning(f"Limit SELL order not filled within {timeout}s - cancelling and retrying as market order")
+                    
+                    # Cancel the limit order
+                    try:
+                        cancel_result = self.api.cancel_order(order_id)
+                        if cancel_result:
+                            logger.info(f"Cancelled unfilled limit SELL order: {order_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to cancel limit order {order_id}: {e}")
+                    
+                    # Fallback to market order
+                    logger.info("Retrying with MARKET order...")
+                    sell_order = self.api.place_market_order(
+                        product_id=product_id,
+                        side='SELL',
+                        size=float(position_size)
+                    )
+                    
+                    if not sell_order:
+                        logger.error(f"Failed to place fallback market SELL order for {product_id}")
+                        return
+                    
+                    order_id = sell_order['order_id']
+                    order_type = 'market_fallback'
+                    logger.info(f"Fallback market SELL order placed: {order_id}")
+                    
+                    # Wait for market order fill
+                    for i in range(10):
+                        time.sleep(1)
+                        order_status = self.api.get_order_status(order_id)
+                        if order_status and order_status['status'] == 'FILLED':
+                            filled = True
+                            
+                            fills = self.api.get_fills(order_id=order_id)
+                            if fills:
+                                total_size = sum(Decimal(str(f['size'])) for f in fills)
+                                weighted_price = sum(Decimal(str(f['price'])) * Decimal(str(f['size'])) for f in fills)
+                                actual_fill_price = weighted_price / total_size if total_size > 0 else current_price
+                                actual_commission = sum(Decimal(str(f['commission'])) for f in fills)
+                            break
+                    
+                    if not filled:
+                        logger.error(f"Fallback market SELL order did not fill: {order_id}")
+                        logger.error("CRITICAL: Position may still be open!")
+                        return
 
             # Recalculate PnL with actual fill price
             pnl = (actual_fill_price - entry_price) * position_size
@@ -652,7 +824,7 @@ class TradeExecutor:
                 'client_order_id': order_id,
                 'product_id': product_id,
                 'side': 'SELL',
-                'order_type': 'market',
+                'order_type': order_type,  # 'market', 'limit_gtc', or 'market_fallback'
                 'status': 'filled',
                 'base_size': position_size,
                 'filled_price': actual_fill_price,
@@ -660,7 +832,9 @@ class TradeExecutor:
                     'exit_reason': exit_reason,
                     'fees_paid': float(actual_commission),
                     'cancelled_orders': cancelled_orders,
-                    'paper_trade': False
+                    'paper_trade': False,
+                    'is_stop_loss': is_stop_loss_exit,
+                    'maker_order': order_type == 'limit_gtc'  # Flag for rebate tracking
                 }
             })
 

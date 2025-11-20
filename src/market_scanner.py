@@ -13,12 +13,14 @@ class MarketScanner:
     def __init__(
         self,
         api: CoinbaseAPI,
-        strategy: BaseStrategy,
-        config: Dict
+        strategy_manager,  # Changed from strategy: BaseStrategy
+        config: Dict,
+        analytics_logger=None
     ):
         self.api = api
-        self.strategy = strategy
+        self.strategy_manager = strategy_manager
         self.config = config
+        self.analytics_logger = analytics_logger
         self._top_buy_signals = []
 
     def scan_all_products(self, shutdown_event):
@@ -54,6 +56,7 @@ class MarketScanner:
             granularity = self.config.get('trading.candle_granularity', 'FIFTEEN_MINUTE')
             periods = self.config.get('trading.candle_periods_for_analysis', 200)
             min_confidence = self.config.get('trading.min_signal_confidence', 0.5)
+            active_strategy_name = self.config.get('strategies.active_strategy', 'momentum')
 
             # OPTIMIZATION: Use parallel processing with ThreadPoolExecutor
             # Scan products in batches to avoid overwhelming the API
@@ -78,11 +81,20 @@ class MarketScanner:
                     if shutdown_event.is_set():
                         return None
 
-                    # Add indicators first so we can display them
-                    df = self.strategy.add_indicators(df)
+                    # Get signals from ALL strategies
+                    # Note: We use the active strategy for adding indicators initially, 
+                    # but get_all_signals should handle strategy-specific indicators if needed.
+                    # Ideally, get_all_signals handles copying df and adding indicators for each strategy.
+                    
+                    all_signals = self.strategy_manager.get_all_signals(df, product_id)
+                    
+                    # Get active strategy signal for decision making
+                    signal = all_signals.get(active_strategy_name)
+                    
+                    if not signal:
+                        logger.warning(f"Active strategy {active_strategy_name} returned no signal for {product_id}")
+                        return None
 
-                    # Get signal
-                    signal = self.strategy.analyze(df, product_id)
                     latest_price = df['Close'].iloc[-1]
 
                     # Extract key indicators for display (check what columns actually exist)
@@ -108,7 +120,7 @@ class MarketScanner:
                     elif rsi is not None:
                         indicators = f"RSI:{rsi:5.1f}"
 
-                    # Log each product scan with details (always show confidence)
+                    # Log active signal
                     confidence_pct = f"{signal.confidence:.1%}"
                     if signal.action == 'BUY':
                         reason = getattr(signal, 'reason', signal.metadata.get('reason', ''))
@@ -119,6 +131,25 @@ class MarketScanner:
                     else:
                         # For HOLD, use debug level
                         logger.debug(f"[SCAN] {product_id:15s} - HOLD {confidence_pct:>6s} @ ${latest_price:>10.4f} | {indicators}")
+
+                    # Log signal analysis for ALL strategies
+                    if self.analytics_logger:
+                        from datetime import datetime
+                        
+                        for strat_name, strat_signal in all_signals.items():
+                            self.analytics_logger.log_signal_analysis(
+                                timestamp=datetime.utcnow(),
+                                product_id=product_id,
+                                signal=strat_signal.action,
+                                confidence=strat_signal.confidence,
+                                current_price=float(latest_price),
+                                indicators={'ADX': float(adx) if adx is not None else None,
+                                          'RSI': float(rsi) if rsi is not None else None},
+                                candle_data=df if strat_name == active_strategy_name else None, # Only save candles once
+                                strategy_name=strat_name,
+                                signal_reasons=strat_signal.metadata.get('reasons', []),
+                                signal_score=strat_signal.metadata.get('score')
+                            )
 
                     # Return ALL BUY signals (both above and below threshold) for tracking
                     if signal.action == 'BUY':
@@ -247,7 +278,15 @@ class MarketScanner:
                 if shutdown_event.is_set():
                     return None
 
-                signal = self.strategy.analyze(df, product_id)
+                # Get signals from ALL strategies
+                all_signals = self.strategy_manager.get_all_signals(df, product_id)
+                
+                # Get active strategy signal
+                active_strategy_name = self.config.get('strategies.active_strategy', 'momentum')
+                signal = all_signals.get(active_strategy_name)
+                
+                if not signal:
+                    return None
 
                 return {
                     'asset': asset,

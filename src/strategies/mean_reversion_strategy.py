@@ -28,24 +28,42 @@ class MeanReversionStrategy(BaseStrategy):
             # Add Bollinger Bands with explicit column mapping
             bbands = df.ta.bbands(length=self.bb_period, std=self.bb_std)
             if bbands is not None and not bbands.empty:
-                df['BB_UPPER'] = bbands[f'BBU_{self.bb_period}_{self.bb_std}']
-                df['BB_MIDDLE'] = bbands[f'BBM_{self.bb_period}_{self.bb_std}']
-                df['BB_LOWER'] = bbands[f'BBL_{self.bb_period}_{self.bb_std}']
+                lower_cols = [c for c in bbands.columns if c.startswith('BBL')]
+                mid_cols = [c for c in bbands.columns if c.startswith('BBM')]
+                upper_cols = [c for c in bbands.columns if c.startswith('BBU')]
+                
+                if lower_cols and mid_cols and upper_cols:
+                    df['BB_UPPER'] = bbands[upper_cols[0]]
+                    df['BB_MIDDLE'] = bbands[mid_cols[0]]
+                    df['BB_LOWER'] = bbands[lower_cols[0]]
             
             # Add RSI with explicit column mapping
             rsi = df.ta.rsi(length=self.rsi_period)
             if rsi is not None:
                 df['RSI'] = rsi
             
+            # Add ATR for dynamic stop-loss calculation
+            df['ATR'] = df.ta.atr(length=14)
+            
             # Add Stochastic with explicit column mapping
             stoch = df.ta.stoch(length=self.stoch_length)
             if stoch is not None and not stoch.empty:
-                df['STOCH_K'] = stoch[f'STOCHk_{self.stoch_length}_3_3']
-                df['STOCH_D'] = stoch[f'STOCHd_{self.stoch_length}_3_3']
+                k_cols = [c for c in stoch.columns if c.startswith('STOCHk')]
+                d_cols = [c for c in stoch.columns if c.startswith('STOCHd')]
+                if k_cols and d_cols:
+                    df['STOCH_K'] = stoch[k_cols[0]]
+                    df['STOCH_D'] = stoch[d_cols[0]]
             
             df['SMA'] = df['Close'].rolling(window=self.mean_lookback).mean()
             
-            df['EMA_LONG'] = df.ta.ema(length=self.ema_long_length)
+            ema_long = df.ta.ema(length=self.ema_long_length)
+            if ema_long is not None:
+                if isinstance(ema_long, pd.DataFrame):
+                    ema_cols = [c for c in ema_long.columns if c.startswith('EMA')]
+                    if ema_cols:
+                        df['EMA_LONG'] = ema_long[ema_cols[0]]
+                else:
+                    df['EMA_LONG'] = ema_long
             
             df['Distance_From_Mean'] = ((df['Close'] - df['SMA']) / df['SMA']) * 100
             
@@ -158,8 +176,15 @@ class MeanReversionStrategy(BaseStrategy):
 
         if buy_confidence > sell_confidence and buy_confidence > 0:
             logger.debug(f"Potential BUY signal for {product_id}: score={buy_score}, confidence={buy_confidence:.2f}")
+            # Include ATR in metadata for dynamic stop-loss calculation
+            atr_value = latest['ATR'] if 'ATR' in df.columns and not pd.isna(latest['ATR']) else None
             return TradingSignal('BUY', confidence=buy_confidence,
-                               metadata={'reasons': buy_reasons, 'score': buy_score})
+                               metadata={
+                                   'reasons': buy_reasons, 
+                                   'score': buy_score,
+                                   'atr': float(atr_value) if atr_value else None,
+                                   'current_price': float(latest['Close'])
+                               })
 
         if sell_confidence > buy_confidence and sell_confidence > 0:
             logger.debug(f"Potential SELL signal for {product_id}: score={sell_score}, confidence={sell_confidence:.2f}")

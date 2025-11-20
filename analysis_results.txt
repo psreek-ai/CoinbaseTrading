@@ -1,0 +1,22 @@
+Analyzing logs\analytics\market_state_20251119_213246.jsonl...
+
+================================================================================
+STRATEGY             | TOTAL    | BUY    | SELL   | HIGH CONF  | AVG BUY CONF
+--------------------------------------------------------------------------------
+momentum             | 11870    | 815    | 9795   | 9          |       35.1%
+mean_reversion       | 11921    | 1735   | 1126   | 57         |       26.2%
+breakout             | 11925    | 5618   | 563    | 3          |       24.1%
+hybrid               | 11911    | 0      | 476    | 0          |        0.0%
+
+================================================================================
+TOP 10 HIGH CONFIDENCE OPPORTUNITIES FOUND:
+2025-11-19T20:58:12.704515 | mean_reversion  | ALEPH-USDC      | 100.0%
+2025-11-19T20:33:32.080965 | mean_reversion  | REQ-USDC        | 85.7%
+2025-11-19T20:33:32.612963 | mean_reversion  | PNG-USDC        | 85.7%
+2025-11-19T20:39:38.922516 | mean_reversion  | REQ-USDC        | 85.7%
+2025-11-19T20:39:39.148010 | mean_reversion  | PNG-USDC        | 85.7%
+2025-11-19T20:45:45.677036 | mean_reversion  | PNG-USDC        | 85.7%
+2025-11-19T20:45:46.085050 | mean_reversion  | REQ-USDC        | 85.7%
+2025-11-19T20:51:51.964072 | mean_reversion  | REQ-USDC        | 85.7%
+2025-11-19T20:51:52.344910 | mean_reversion  | PNG-USDC        | 85.7%
+2025-11-19T20:57:58.486596 | mean_reversion  | REQ-USDC        | 85.7%

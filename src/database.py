@@ -145,12 +145,28 @@ class DatabaseManager:
             )
         """)
         
+        # Market regime tracking table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS regime_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                regime TEXT NOT NULL,
+                adx REAL,
+                confidence REAL,
+                trend_direction TEXT,
+                volatility REAL,
+                strategy_used TEXT,
+                metadata TEXT
+            )
+        """)
+        
         # Create indexes for faster queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_product ON orders(product_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trade_history_product ON trade_history(product_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_equity_curve_timestamp ON equity_curve(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_regime_timestamp ON regime_history(timestamp)")
         
         self.conn.commit()
         logger.info(f"Database initialized at {self.db_path}")
@@ -508,6 +524,114 @@ class DatabaseManager:
             else:
                 processed[key] = value
         return processed
+    
+    def insert_regime_change(self, regime_info: Dict[str, Any], strategy_used: str) -> int:
+        """
+        Insert market regime detection event.
+        
+        Args:
+            regime_info: Dictionary from MarketRegimeDetector.detect_regime()
+            strategy_used: Name of the strategy selected for this regime
+            
+        Returns:
+            Row ID of inserted record
+        """
+        with self.db_lock:
+            cursor = self.conn.cursor()
+            
+            # Extract regime enum value
+            regime = regime_info['regime'].value if hasattr(regime_info['regime'], 'value') else str(regime_info['regime'])
+            
+            cursor.execute("""
+                INSERT INTO regime_history (
+                    regime, adx, confidence, trend_direction, 
+                    volatility, strategy_used, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                regime,
+                regime_info.get('adx'),
+                regime_info.get('confidence'),
+                regime_info.get('trend_direction'),
+                regime_info.get('volatility'),
+                strategy_used,
+                json.dumps(regime_info.get('metadata', {}))
+            ))
+            
+            self.conn.commit()
+            return cursor.lastrowid
+    
+    def get_regime_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get recent regime history.
+        
+        Args:
+            limit: Maximum number of records to return
+            
+        Returns:
+            List of regime history records
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM regime_history 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        """, (limit,))
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def get_performance_by_regime(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Calculate trading performance metrics by market regime.
+        
+        Returns:
+            Dictionary with regime as key and performance metrics as value
+        """
+        cursor = self.conn.cursor()
+        
+        # Get trades with their regime at entry time
+        cursor.execute("""
+            SELECT 
+                r.regime,
+                r.strategy_used,
+                COUNT(t.id) as trade_count,
+                SUM(CASE WHEN CAST(t.pnl AS REAL) > 0 THEN 1 ELSE 0 END) as winning_trades,
+                SUM(CAST(t.pnl AS REAL)) as total_pnl,
+                AVG(CAST(t.pnl AS REAL)) as avg_pnl,
+                MAX(CAST(t.pnl AS REAL)) as max_win,
+                MIN(CAST(t.pnl AS REAL)) as max_loss
+            FROM trade_history t
+            LEFT JOIN regime_history r ON 
+                r.timestamp <= t.entry_time 
+                AND r.timestamp = (
+                    SELECT MAX(timestamp) 
+                    FROM regime_history 
+                    WHERE timestamp <= t.entry_time
+                )
+            WHERE t.pnl IS NOT NULL
+            GROUP BY r.regime, r.strategy_used
+        """)
+        
+        results = {}
+        for row in cursor.fetchall():
+            regime = row['regime'] or 'unknown'
+            strategy = row['strategy_used'] or 'unknown'
+            key = f"{regime}_{strategy}"
+            
+            win_rate = (row['winning_trades'] / row['trade_count'] * 100) if row['trade_count'] > 0 else 0
+            
+            results[key] = {
+                'regime': regime,
+                'strategy': strategy,
+                'trade_count': row['trade_count'],
+                'winning_trades': row['winning_trades'],
+                'win_rate': win_rate,
+                'total_pnl': row['total_pnl'] or 0,
+                'avg_pnl': row['avg_pnl'] or 0,
+                'max_win': row['max_win'] or 0,
+                'max_loss': row['max_loss'] or 0
+            }
+        
+        return results
     
     def close(self):
         """Close database connection."""

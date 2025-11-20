@@ -9,9 +9,9 @@ api:
 # Trading Parameters
 trading:
   # Supported: ONE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, TWO_HOUR, SIX_HOUR, ONE_DAY
-  candle_granularity: "FIFTEEN_MINUTE"  # Changed from FIVE_MINUTE for better data availability
+  candle_granularity: "ONE_HOUR"  # Changed from FIFTEEN_MINUTE to reduce noise and false signals
   candle_periods_for_analysis: 200  # Increased from 100 for more reliable indicators
-  loop_sleep_seconds: 60
+  loop_sleep_seconds: 300  # 5 minutes - increased from 60s to match hourly timeframe
   max_products_to_analyze: 20
   max_ws_subscriptions: 100
   
@@ -25,10 +25,10 @@ trading:
   max_holdings_workers: 2  # Max concurrent threads for holdings analysis (1-3 recommended)
   
   # Minimum signal confidence to execute trades (0.0 to 1.0)
-  min_signal_confidence: 0.50  # 50% confidence threshold for production trading
+  min_signal_confidence: 0.60  # 60% confidence threshold - increased from 50% to reduce false signals
   
   # IMPORTANT: Set to false for live trading
-  paper_trading_mode: false
+  paper_trading_mode: true
 
 # Risk Management
 risk_management:
@@ -67,12 +67,20 @@ risk_management:
   max_slippage_percent: 0.01  # 1%
   
   # Order fill timeout (seconds to wait for limit order to fill before cancelling)
-  order_fill_timeout: 60  # 60 seconds
+  order_fill_timeout: 300  # 300 seconds (5 minutes) - increased from 60s to reduce cancellation rate
+
+# AI Analysis Configuration
+ai_analysis:
+  enabled: true
+  analysis_interval_minutes: 60  # How often to ask AI for strategy recommendation
+  min_data_points: 50  # Minimum data points before AI analysis
+  min_confidence: 0.7  # Minimum confidence to switch strategies based on AI
+  model: "x-ai/grok-4.1-fast"  # OpenRouter model
 
 # Strategy Selection and Parameters
 strategies:
   # Active strategy: momentum, mean_reversion, breakout, hybrid, or custom
-  active_strategy: "momentum"
+  active_strategy: "mean_reversion"
   
   # Momentum Strategy Parameters
   momentum:
@@ -92,7 +100,7 @@ strategies:
     adx_threshold: 15
     volume_confirmation_multiplier: 2.5
     price_proximity_threshold: 0.015
-    rsi_momentum_buy_lower_bound: 50
+    rsi_momentum_buy_lower_bound: 60  # Increased from 50 to reduce false breakouts
     rsi_momentum_buy_upper_bound: 75
     rsi_momentum_sell_upper_bound: 40
   
@@ -101,7 +109,7 @@ strategies:
     bb_period: 20
     bb_std: 2.0
     rsi_period: 14
-    rsi_extreme_oversold: 20
+    rsi_extreme_oversold: 25  # Increased from 20 to reduce whipsaw trades
     rsi_extreme_overbought: 80
     mean_lookback: 50
     stoch_length: 14
@@ -179,6 +187,31 @@ database:
   backup_enabled: true
   backup_interval: 86400  # seconds (24 hours)
 
+# Market Regime Detection Configuration
+regime_detection:
+  # Reference product for regime analysis (typically BTC-USD for crypto markets)
+  regime_reference_product: "BTC-USD"
+  
+  # Timeframe for regime analysis (higher timeframe = more stable regime detection)
+  # Supported: FIVE_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, TWO_HOUR, SIX_HOUR, ONE_DAY
+  regime_timeframe: "ONE_HOUR"
+  
+  # ADX thresholds for regime classification
+  adx_trending_threshold: 25    # ADX > 25 = Trending market (use Momentum)
+  adx_ranging_threshold: 20     # ADX < 20 = Ranging market (use Mean Reversion)
+  adx_period: 14                # Period for ADX calculation
+  
+  # Additional indicators for regime confirmation
+  volatility_lookback: 20       # Lookback period for volatility calculation
+  volatility_threshold: 2.0     # Threshold for high volatility detection
+  
+  # EMAs for trend direction (used in regime analysis)
+  regime_ema_fast: 20
+  regime_ema_slow: 50
+  
+  # Cache duration to avoid excessive recalculation
+  regime_cache_duration_seconds: 300  # 5 minutes (re-check regime every 5 min)
+
 # Backtesting Configuration
 backtesting:
   enabled: false
@@ -201,3 +234,4 @@ logging:
   log_api_responses: true  # Log raw API responses to separate file
   api_log_file: "logs/api_responses.log"  # Separate file for API calls
   log_api_errors_only: false  # If true, only log failed API calls
+
